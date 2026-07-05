@@ -1,11 +1,18 @@
 import type { Db } from "../db.js";
 import {
+  DEFAULT_QUALIFIER_PRIORITY,
+  getEdiPartnerMapping,
+  xrefSku,
+  type EdiPartnerMapping,
+} from "../mappings.js";
+import {
   generate855,
   generate856,
   generate810,
   generate997,
   parse850,
   type Edi850,
+  type Edi850Line,
 } from "./sets.js";
 import { parseInterchange, type X12Interchange, type X12Transaction } from "./x12.js";
 
@@ -132,6 +139,7 @@ export async function processInboundInterchange(db: Db, orgId: string, raw: stri
 
   const orderIds: string[] = [];
   try {
+    const mapping = await getEdiPartnerMapping(db, orgId, partner.id);
     for (const group of interchange.groups) {
       for (const txn of group.transactions) {
         if (txn.set !== "850") {
@@ -140,7 +148,7 @@ export async function processInboundInterchange(db: Db, orgId: string, raw: stri
         if (!partner.partner_org_id) {
           throw new Error(`EDI partner "${partner.name}" is not linked to a platform org`);
         }
-        const orderId = await createOrderFrom850(db, orgId, partner.partner_org_id, txn);
+        const orderId = await createOrderFrom850(db, orgId, partner.partner_org_id, txn, mapping);
         orderIds.push(orderId);
       }
     }
@@ -167,36 +175,81 @@ export async function processInboundInterchange(db: Db, orgId: string, raw: stri
   return { messageId, transactionSet, status: "processed", error: null, orderIds, ack997Id };
 }
 
+export interface ResolvedLine {
+  line: Edi850Line;
+  /** Identifier value used for the lookup (after cross-reference). */
+  lookup: string | null;
+  product: { id: string; sku: string; name: string } | null;
+  error: string | null;
+}
+
+/**
+ * Resolves 850 lines to seller products, honoring the partner's mapping
+ * profile (qualifier priority + SKU cross-reference). VN/BP resolve against
+ * products.sku, UP against products.barcode — a cross-referenced value always
+ * resolves against products.sku. Read-only; shared by ingestion and preview.
+ */
+export async function resolve850Lines(
+  db: Db,
+  sellerOrgId: string,
+  lines: Edi850Line[],
+  mapping: EdiPartnerMapping = {},
+): Promise<ResolvedLine[]> {
+  const priority = mapping.qualifier_priority ?? DEFAULT_QUALIFIER_PRIORITY;
+  const results: ResolvedLine[] = [];
+  for (const line of lines) {
+    const byQualifier = { VN: line.vendorPart, UP: line.upc, BP: line.buyerPart };
+    let resolved: ResolvedLine = {
+      line,
+      lookup: null,
+      product: null,
+      error: `PO1 line ${line.lineNumber} has no product identifier for qualifiers ${priority.join("/")}`,
+    };
+    for (const qualifier of priority) {
+      const value = byQualifier[qualifier];
+      if (!value) continue;
+      const mapped = xrefSku(value, mapping.sku_xref);
+      const wasXrefed = mapped !== value;
+      let query = db.from("products").select("id, sku, name").eq("org_id", sellerOrgId).limit(1);
+      // UP is a barcode lookup unless the xref already translated it to a SKU.
+      query = qualifier === "UP" && !wasXrefed ? query.eq("barcode", mapped) : query.ilike("sku", mapped);
+      const { data: products, error } = await query;
+      if (error) throw new Error(`product lookup failed: ${error.message}`);
+      if (products?.[0]) {
+        resolved = { line, lookup: mapped, product: products[0], error: null };
+        break;
+      }
+      resolved = {
+        line,
+        lookup: mapped,
+        product: null,
+        error: `PO1 line ${line.lineNumber}: no product matches ${qualifier} ${mapped}`,
+      };
+    }
+    results.push(resolved);
+  }
+  return results;
+}
+
 async function createOrderFrom850(
   db: Db,
   sellerOrgId: string,
   buyerOrgId: string,
   txn: X12Transaction,
+  mapping: EdiPartnerMapping,
 ): Promise<string> {
   const po: Edi850 = parse850(txn);
 
-  // Resolve every PO1 line to a seller product: VN → sku, UP → barcode.
-  const resolved: { product_id: string; sku: string; name: string; quantity: number; unit_price: number }[] = [];
-  for (const line of po.lines) {
-    let query = db.from("products").select("id, sku, name").eq("org_id", sellerOrgId).limit(1);
-    if (line.vendorPart) query = query.ilike("sku", line.vendorPart);
-    else if (line.upc) query = query.eq("barcode", line.upc);
-    else throw new Error(`PO1 line ${line.lineNumber} has no VN or UP product identifier`);
-    const { data: products, error } = await query;
-    if (error) throw new Error(`product lookup failed: ${error.message}`);
-    const product = products?.[0];
-    if (!product) {
-      const ident = line.vendorPart ?? line.upc;
-      throw new Error(`PO1 line ${line.lineNumber}: no product matches ${ident}`);
-    }
-    resolved.push({
-      product_id: product.id,
-      sku: product.sku,
-      name: product.name,
-      quantity: line.quantity,
-      unit_price: line.unitPrice ?? 0,
-    });
-  }
+  const resolution = await resolve850Lines(db, sellerOrgId, po.lines, mapping);
+  const failures = resolution.filter((r) => r.error);
+  if (failures.length > 0) throw new Error(failures.map((f) => f.error).join("; "));
+  const resolved = resolution.map((r) => ({
+    product_id: r.product!.id,
+    sku: r.product!.sku,
+    name: r.product!.name,
+    quantity: r.line.quantity,
+    unit_price: r.line.unitPrice ?? 0,
+  }));
 
   const subtotal = resolved.reduce((sum, l) => sum + l.quantity * l.unit_price, 0);
   const { data: order, error: orderError } = await db

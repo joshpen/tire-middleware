@@ -4,7 +4,7 @@ import type { Config } from "./config.js";
 import type { Db } from "./db.js";
 import { applyInventoryRows } from "./domain/inventory.js";
 import { processInboundInterchange } from "./edi/service.js";
-import { pollEndpoint } from "./files/poller.js";
+import { registerAdminRoutes } from "./routes/admin.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -145,23 +145,7 @@ export function buildServer(config: Config, db: Db): FastifyInstance {
     },
   );
 
-  // Manual poll trigger: service-role callers only (deploy operators, hub functions).
-  app.post<{ Params: { endpointId: string } }>("/admin/poll/:endpointId", async (req, reply) => {
-    const header = req.headers.authorization ?? "";
-    const token = header.replace(/^Bearer\s+/i, "").trim();
-    if (!token || token !== config.serviceRoleKey) {
-      return reply.code(401).send({ ok: false, status: 401, error: "service role key required" });
-    }
-    const { data: endpoint, error } = await db
-      .from("file_endpoints")
-      .select("id, org_id, name, kind, file_type, config, created_by")
-      .eq("id", req.params.endpointId)
-      .maybeSingle();
-    if (error) throw new Error(`endpoint lookup failed: ${error.message}`);
-    if (!endpoint) return reply.code(404).send({ ok: false, status: 404, error: "endpoint not found" });
-    const outcome = await pollEndpoint(db, endpoint);
-    return { ok: outcome.status === "success", ...outcome };
-  });
+  registerAdminRoutes(app, config, db);
 
   return app;
 }

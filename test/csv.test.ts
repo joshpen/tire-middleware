@@ -36,6 +36,40 @@ describe("parsePriceCsv", () => {
   });
 });
 
+describe("mapping profiles", () => {
+  it("uses explicit column overrides", () => {
+    const rows = parseInventoryCsv("PartNo,OnHandQty,Warehouse\nA1,7,X\n", {
+      sku_column: "PartNo",
+      qty_column: "OnHandQty",
+    });
+    expect(rows).toEqual([{ sku: "A1", qty: 7 }]);
+  });
+
+  it("errors clearly when a mapped column is missing", () => {
+    expect(() => parseInventoryCsv("sku,qty\nA,1\n", { qty_column: "NoSuchCol" })).toThrow(/mapped columns not found/);
+  });
+
+  it("applies sku cross-reference case-insensitively", () => {
+    const rows = parseInventoryCsv("sku,qty\nVENDOR-99,4\nplain,2\n", {
+      sku_xref: { "vendor-99": "LT245-75R17-E" },
+    });
+    expect(rows).toEqual([
+      { sku: "LT245-75R17-E", qty: 4 },
+      { sku: "plain", qty: 2 },
+    ]);
+  });
+
+  it("applies qty and price multipliers", () => {
+    expect(parseInventoryCsv("sku,qty\nA,3\n", { qty_multiplier: 4 })).toEqual([{ sku: "A", qty: 12 }]);
+    expect(parsePriceCsv("sku,price\nA,14150\n", { price_multiplier: 0.01 })).toEqual([{ sku: "A", price: 141.5 }]);
+  });
+
+  it("supports alternate delimiters", () => {
+    const rows = parsePriceCsv("sku;price\nA;9.99\n", { delimiter: ";" });
+    expect(rows).toEqual([{ sku: "A", price: 9.99 }]);
+  });
+});
+
 describe("classifyContent", () => {
   it("routes ISA content to EDI regardless of declared type", () => {
     expect(classifyContent("ISA*00*...", "csv_inventory")).toBe("edi");

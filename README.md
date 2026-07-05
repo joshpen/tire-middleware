@@ -49,6 +49,8 @@ All data is org-scoped by the key's `org_id`.
 | `POST /v1/inventory` | `inventory:write` | `{rows:[{sku,qty}]}` → `stock_qty`; status ≤0 backorder, ≤8 low_stock |
 | `POST /v1/edi` | `edi:write` | raw X12 body → stored in `edi_messages`, then processed |
 | `POST /admin/poll/:endpointId` | service-role key | manual file-endpoint poll |
+| `POST /admin/preview/parse` | service-role key | dry-run classify/parse/resolve, no writes |
+| `POST /admin/preview/fetch/:endpointId` | service-role key | fetch sample files, nothing marked processed |
 
 ## EDI X12
 
@@ -70,6 +72,27 @@ Content starting with `ISA` goes to EDI intake; otherwise CSV routed by
 sniffs headers). Outcomes land in `integration_runs` and the endpoint's
 `last_polled_at`/`last_error`. Credentials live only in the config jsonb and
 env — they are never logged.
+
+## Mapping profiles (data-driven, for a management UI)
+
+Supplier-specific data mapping is configuration, not code, so a hub UI can
+manage it without gateway deploys:
+
+- **CSV** — `file_endpoints.config.mapping`: `sku_column` / `qty_column` /
+  `price_column` header overrides, `delimiter`, `sku_xref` (external →
+  internal SKU), `qty_multiplier`, `price_multiplier`.
+- **EDI** — per-partner profiles under
+  `org_integrations.config.edi_mappings[<edi_partner_id>]` on the org's
+  `file_gateway` provider instance: `qualifier_priority` (default
+  `["VN","UP","BP"]`) and `sku_xref`. VN/BP resolve against `products.sku`,
+  UP against `products.barcode`; cross-referenced values resolve as SKUs.
+
+The preview endpoints support the UI workflow: `POST /admin/preview/parse`
+accepts `{content, file_type?, org_id?, mapping?, edi_mapping?}` and returns
+classification, mapped rows / resolved 850 lines, unknown SKUs, and partner
+resolution — without writing anything — so a trial mapping can be validated
+before saving. `POST /admin/preview/fetch/:endpointId` pulls sample files
+(with classification + content sample) without marking them processed.
 
 ## Verification
 

@@ -1,7 +1,7 @@
 import type { Db } from "../db.js";
 import { applyInventoryRows, applyPriceRows } from "../domain/inventory.js";
 import { processInboundInterchange } from "../edi/service.js";
-import { classifyContent, parseInventoryCsv, parsePriceCsv } from "./csv.js";
+import { classifyContent, parseInventoryCsv, parsePriceCsv, type CsvMapping } from "./csv.js";
 import { ensureRunContext, finishRun, startRun } from "./runs.js";
 import {
   fetchHttpsFile,
@@ -31,6 +31,12 @@ export interface PollOutcome {
   errors: string[];
 }
 
+function endpointMapping(endpoint: EndpointRow): CsvMapping {
+  const config = (endpoint.config ?? {}) as Record<string, unknown>;
+  const mapping = config.mapping;
+  return mapping && typeof mapping === "object" && !Array.isArray(mapping) ? (mapping as CsvMapping) : {};
+}
+
 async function ingestFile(db: Db, endpoint: EndpointRow, file: RemoteFile): Promise<number> {
   const kind = classifyContent(file.content, endpoint.file_type);
   if (kind === "edi") {
@@ -38,12 +44,13 @@ async function ingestFile(db: Db, endpoint: EndpointRow, file: RemoteFile): Prom
     if (result.status === "error") throw new Error(`edi intake failed: ${result.error}`);
     return result.orderIds.length || 1;
   }
+  const mapping = endpointMapping(endpoint);
   if (kind === "csv_inventory") {
-    const rows = parseInventoryCsv(file.content);
+    const rows = parseInventoryCsv(file.content, mapping);
     const result = await applyInventoryRows(db, endpoint.org_id, rows);
     return result.updated;
   }
-  const rows = parsePriceCsv(file.content);
+  const rows = parsePriceCsv(file.content, mapping);
   const result = await applyPriceRows(db, endpoint.org_id, rows);
   return result.updated;
 }
