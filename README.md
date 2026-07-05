@@ -48,6 +48,7 @@ All data is org-scoped by the key's `org_id`.
 | `POST /v1/orders/:idOrPoNumber/ack` | `orders:write` | submitted → confirmed |
 | `POST /v1/inventory` | `inventory:write` | `{rows:[{sku,qty}]}` → `stock_qty`; status ≤0 backorder, ≤8 low_stock |
 | `POST /v1/edi` | `edi:write` | raw X12 body → stored in `edi_messages`, then processed |
+| `GET/POST /v1/objects/:key` | config-declared | dynamic objects exposed via `exposed_objects` |
 | `POST /admin/poll/:endpointId` | service-role key | manual file-endpoint poll |
 | `POST /admin/preview/parse` | service-role key | dry-run classify/parse/resolve, no writes |
 | `POST /admin/preview/fetch/:endpointId` | service-role key | fetch sample files, nothing marked processed |
@@ -86,6 +87,29 @@ manage it without gateway deploys:
   `file_gateway` provider instance: `qualifier_priority` (default
   `["VN","UP","BP"]`) and `sku_xref`. VN/BP resolve against `products.sku`,
   UP against `products.barcode`; cross-referenced values resolve as SKUs.
+
+## Dynamic destinations & objects
+
+The hub's schema and data objects evolve; the gateway follows through
+configuration, not deploys:
+
+- **Dynamic ingest targets** — `mapping.target` on a file endpoint routes rows
+  into *any* table: `{table, match: {column, field}, set: {field: column},
+  coerce?, insert_missing?, defaults?}`. Dotted fields
+  (`field_values.tread_depth_mm`) merge into jsonb columns, which is how the
+  platform's dynamic custom fields are populated. Tables/columns are validated
+  against the live schema at run time (PostgREST), not the vendored types.
+- **Dynamic API objects** — `exposed_objects` in the org's gateway config
+  declares new REST resources under `GET/POST /v1/objects/:key` (table,
+  select, filterable fields, writable fields + match field, per-object read
+  and write scopes). New hub tables become API surface by editing config.
+- **Rules as data** — stock status thresholds are org-configurable
+  (`stock_status_rules: {thresholds: [{max, status}], fallback}`), used by
+  both `/v1/inventory` and the CSV pipeline.
+
+Org-level gateway config lives in `org_integrations.config` on the org's
+`file_gateway` provider instance: `edi_mappings`, `exposed_objects`,
+`stock_status_rules`.
 
 The preview endpoints support the UI workflow: `POST /admin/preview/parse`
 accepts `{content, file_type?, org_id?, mapping?, edi_mapping?}` and returns

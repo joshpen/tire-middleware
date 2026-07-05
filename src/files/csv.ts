@@ -1,4 +1,5 @@
 import type { InventoryRow, PriceRow } from "../domain/inventory.js";
+import type { IngestTarget } from "../dynamic.js";
 
 /**
  * Per-endpoint CSV mapping profile, stored in `file_endpoints.config.mapping`
@@ -17,6 +18,12 @@ export interface CsvMapping {
   qty_multiplier?: number;
   /** Multiply parsed price (e.g. cents → dollars). */
   price_multiplier?: number;
+  /**
+   * Dynamic destination: when present, rows are routed by the generic ingest
+   * engine (any table/fields incl. jsonb custom fields) instead of the
+   * built-in stock/price paths.
+   */
+  target?: IngestTarget;
 }
 
 function applyXref(sku: string, xref?: Record<string, string>): string {
@@ -126,6 +133,32 @@ export function parsePriceCsv(text: string, mapping: CsvMapping = {}): PriceRow[
     out.push({ sku: applyXref(sku, mapping.sku_xref), price: price * multiplier });
   }
   return out;
+}
+
+/**
+ * Parses a CSV into normalized-header row objects for the dynamic ingest
+ * engine. If the mapping carries a sku_xref and a match column, the
+ * cross-reference is applied to that column's values.
+ */
+export function parseGenericCsv(
+  text: string,
+  mapping: CsvMapping = {},
+  xrefColumn?: string,
+): Record<string, string>[] {
+  const rows = parseCsv(text, mapping.delimiter ?? ",");
+  const headers = rows[0];
+  if (!headers) throw new CsvFormatError("empty CSV");
+  const keys = headers.map((h) => h.trim().toLowerCase().replace(/[\s-]+/g, "_"));
+  const xrefKey = xrefColumn?.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return rows.slice(1).map((row) => {
+    const record: Record<string, string> = {};
+    keys.forEach((key, i) => {
+      let value = (row[i] ?? "").trim();
+      if (key === xrefKey && mapping.sku_xref) value = applyXref(value, mapping.sku_xref);
+      record[key] = value;
+    });
+    return record;
+  });
 }
 
 export type FileKind = "edi" | "csv_inventory" | "csv_prices";

@@ -3,7 +3,9 @@ import { registerApiKeyAuth } from "./auth/apiKey.js";
 import type { Config } from "./config.js";
 import type { Db } from "./db.js";
 import { applyInventoryRows } from "./domain/inventory.js";
+import { applyDynamicRows, type IngestTarget } from "./dynamic.js";
 import { processInboundInterchange } from "./edi/service.js";
+import { getExposedObjects, getStockStatusRules } from "./mappings.js";
 import { registerAdminRoutes } from "./routes/admin.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -107,7 +109,8 @@ export function buildServer(config: Config, db: Db): FastifyInstance {
         .map((r) => ({ sku: String(r.sku ?? "").trim(), qty: Number(r.qty) }))
         .filter((r) => r.sku && Number.isFinite(r.qty))
         .map((r) => ({ sku: r.sku, qty: Math.trunc(r.qty) }));
-      const result = await applyInventoryRows(db, orgId, clean);
+      const rules = await getStockStatusRules(db, orgId);
+      const result = await applyInventoryRows(db, orgId, clean, rules);
       return { ok: true, updated: result.updated, unknown_skus: result.unknownSkus };
     },
   );
@@ -142,6 +145,84 @@ export function buildServer(config: Config, db: Db): FastifyInstance {
         order_ids: result.orderIds,
         ack_997_id: result.ack997Id,
       };
+    },
+  );
+
+  // ── Dynamic objects ─────────────────────────────────────────────────────────
+  // The exposed surface is declared in the org's gateway config
+  // (`exposed_objects`), so new hub tables become API resources without a
+  // gateway deploy. Scopes are config-declared per object.
+
+  app.get<{ Params: { key: string }; Querystring: Record<string, string> }>(
+    "/v1/objects/:key",
+    { preHandler: [authenticate] },
+    async (req, reply) => {
+      const client = req.apiClient!;
+      const objects = await getExposedObjects(db, client.org_id);
+      const object = objects[req.params.key];
+      if (!object) {
+        req.apiError = "unknown object";
+        return reply.code(404).send({ ok: false, status: 404, error: `unknown object ${req.params.key}` });
+      }
+      if (!client.scopes.includes(object.scope)) {
+        req.apiError = `missing scope ${object.scope}`;
+        return reply.code(403).send({ ok: false, status: 403, error: `missing scope ${object.scope}` });
+      }
+      let query = (db.from as (t: string) => any)(object.table)
+        .select(object.select ?? "*")
+        .eq(object.org_column ?? "org_id", client.org_id)
+        .limit(Math.min(Number(req.query.limit) || object.limit || 100, 500));
+      for (const field of object.filterable_fields ?? []) {
+        if (req.query[field] !== undefined) query = query.eq(field, req.query[field]);
+      }
+      const { data, error } = await query;
+      if (error) throw new Error(`${object.table} query failed: ${error.message}`);
+      return { ok: true, object: req.params.key, rows: data ?? [] };
+    },
+  );
+
+  app.post<{ Params: { key: string }; Body: { rows?: Record<string, unknown>[] } }>(
+    "/v1/objects/:key",
+    { preHandler: [authenticate] },
+    async (req, reply) => {
+      const client = req.apiClient!;
+      const objects = await getExposedObjects(db, client.org_id);
+      const object = objects[req.params.key];
+      if (!object) {
+        req.apiError = "unknown object";
+        return reply.code(404).send({ ok: false, status: 404, error: `unknown object ${req.params.key}` });
+      }
+      const writable = object.writable_fields ?? [];
+      if (writable.length === 0 || !object.match_field) {
+        req.apiError = "object is read-only";
+        return reply.code(405).send({ ok: false, status: 405, error: `object ${req.params.key} is read-only` });
+      }
+      const writeScope = object.write_scope ?? object.scope;
+      if (!client.scopes.includes(writeScope)) {
+        req.apiError = `missing scope ${writeScope}`;
+        return reply.code(403).send({ ok: false, status: 403, error: `missing scope ${writeScope}` });
+      }
+      const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
+      if (!rows) {
+        req.apiError = "body must be {rows:[...]}";
+        return reply.code(400).send({ ok: false, status: 400, error: "body must be {rows:[...]}" });
+      }
+      // Reuse the ingest engine: match on match_field, patch only writable fields.
+      const stringRows = rows.map((r) =>
+        Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v === null || v === undefined ? "" : String(v)])),
+      );
+      const target: IngestTarget = {
+        table: object.table,
+        org_column: object.org_column ?? "org_id",
+        match: { column: object.match_field, field: object.match_field },
+        set: Object.fromEntries(writable.map((f) => [f, f])),
+      };
+      const result = await applyDynamicRows(db, client.org_id, stringRows, target);
+      if (result.errors.length) {
+        req.apiError = result.errors.join("; ").slice(0, 500);
+        return reply.code(422).send({ ok: false, status: 422, error: result.errors.join("; "), ...result });
+      }
+      return { ok: true, updated: result.updated, inserted: result.inserted, unmatched: result.unmatched };
     },
   );
 

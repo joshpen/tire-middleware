@@ -1,7 +1,9 @@
 import type { Db } from "../db.js";
 import { applyInventoryRows, applyPriceRows } from "../domain/inventory.js";
 import { processInboundInterchange } from "../edi/service.js";
-import { classifyContent, parseInventoryCsv, parsePriceCsv, type CsvMapping } from "./csv.js";
+import { applyDynamicRows } from "../dynamic.js";
+import { getStockStatusRules } from "../mappings.js";
+import { classifyContent, parseGenericCsv, parseInventoryCsv, parsePriceCsv, type CsvMapping } from "./csv.js";
 import { ensureRunContext, finishRun, startRun } from "./runs.js";
 import {
   fetchHttpsFile,
@@ -38,16 +40,26 @@ function endpointMapping(endpoint: EndpointRow): CsvMapping {
 }
 
 async function ingestFile(db: Db, endpoint: EndpointRow, file: RemoteFile): Promise<number> {
+  const mapping = endpointMapping(endpoint);
+
+  // A dynamic target routes any non-EDI file through the generic engine.
+  if (mapping.target && !file.content.trimStart().startsWith("ISA")) {
+    const rows = parseGenericCsv(file.content, mapping, mapping.target.match.column);
+    const result = await applyDynamicRows(db, endpoint.org_id, rows, mapping.target);
+    if (result.errors.length) throw new Error(result.errors.join("; "));
+    return result.updated + result.inserted;
+  }
+
   const kind = classifyContent(file.content, endpoint.file_type);
   if (kind === "edi") {
     const result = await processInboundInterchange(db, endpoint.org_id, file.content);
     if (result.status === "error") throw new Error(`edi intake failed: ${result.error}`);
     return result.orderIds.length || 1;
   }
-  const mapping = endpointMapping(endpoint);
   if (kind === "csv_inventory") {
     const rows = parseInventoryCsv(file.content, mapping);
-    const result = await applyInventoryRows(db, endpoint.org_id, rows);
+    const rules = await getStockStatusRules(db, endpoint.org_id);
+    const result = await applyInventoryRows(db, endpoint.org_id, rows, rules);
     return result.updated;
   }
   const rows = parsePriceCsv(file.content, mapping);

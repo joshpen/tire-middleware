@@ -4,7 +4,8 @@ import type { Db } from "../db.js";
 import { resolve850Lines } from "../edi/service.js";
 import { parse850 } from "../edi/sets.js";
 import { parseInterchange, type X12Interchange } from "../edi/x12.js";
-import { classifyContent, parseInventoryCsv, parsePriceCsv, type CsvMapping } from "../files/csv.js";
+import { planDynamicRows } from "../dynamic.js";
+import { classifyContent, parseGenericCsv, parseInventoryCsv, parsePriceCsv, type CsvMapping } from "../files/csv.js";
 import { pollEndpoint } from "../files/poller.js";
 import {
   fetchHttpsFile,
@@ -65,6 +66,29 @@ export function registerAdminRoutes(app: FastifyInstance, config: Config, db: Db
       const { content, file_type = "auto", org_id, mapping, edi_mapping } = req.body ?? {};
       if (!content || typeof content !== "string") {
         return reply.code(400).send({ ok: false, status: 400, error: "body must include content (string)" });
+      }
+
+      // Dynamic target dry-run: plan the generic ingest without writing.
+      if (mapping?.target && !content.trimStart().startsWith("ISA")) {
+        if (!org_id) {
+          return reply.code(400).send({ ok: false, status: 400, error: "org_id is required to preview a target" });
+        }
+        try {
+          const rows = parseGenericCsv(content, mapping, mapping.target.match.column);
+          const plan = await planDynamicRows(db, org_id, rows, mapping.target);
+          return {
+            ok: true,
+            classification: "dynamic",
+            target: { table: mapping.target.table, match: mapping.target.match },
+            row_count: plan.length,
+            would_update: plan.filter((p) => p.action === "update").length,
+            would_insert: plan.filter((p) => p.action === "insert").length,
+            unmatched: plan.filter((p) => p.error === "no matching row").map((p) => p.matchValue),
+            plan: plan.slice(0, ROW_LIMIT),
+          };
+        } catch (err) {
+          return { ok: true, classification: "dynamic", error: err instanceof Error ? err.message : String(err) };
+        }
       }
 
       let classification: string;

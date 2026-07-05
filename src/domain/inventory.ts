@@ -1,9 +1,28 @@
 import type { Db } from "../db.js";
 
-export function stockStatusFor(qty: number): "backorder" | "low_stock" | "in_stock" {
-  if (qty <= 0) return "backorder";
-  if (qty <= 8) return "low_stock";
-  return "in_stock";
+/**
+ * Threshold rules evaluated in order: first rule with qty <= max wins,
+ * otherwise `fallback`. Overridable per org via the gateway org config
+ * (`stock_status_rules`) so the hub can tune statuses without a deploy.
+ */
+export interface StockStatusRules {
+  thresholds: { max: number; status: string }[];
+  fallback: string;
+}
+
+export const DEFAULT_STOCK_STATUS_RULES: StockStatusRules = {
+  thresholds: [
+    { max: 0, status: "backorder" },
+    { max: 8, status: "low_stock" },
+  ],
+  fallback: "in_stock",
+};
+
+export function stockStatusFor(qty: number, rules: StockStatusRules = DEFAULT_STOCK_STATUS_RULES): string {
+  for (const rule of rules.thresholds) {
+    if (qty <= rule.max) return rule.status;
+  }
+  return rules.fallback;
 }
 
 export interface InventoryRow {
@@ -20,7 +39,12 @@ export interface ApplyResult {
  * Applies stock rows to products in the org, matching SKUs
  * case-insensitively and deriving stock_status from the thresholds.
  */
-export async function applyInventoryRows(db: Db, orgId: string, rows: InventoryRow[]): Promise<ApplyResult> {
+export async function applyInventoryRows(
+  db: Db,
+  orgId: string,
+  rows: InventoryRow[],
+  rules: StockStatusRules = DEFAULT_STOCK_STATUS_RULES,
+): Promise<ApplyResult> {
   if (rows.length === 0) return { updated: 0, unknownSkus: [] };
   const { data: products, error } = await db.from("products").select("id, sku").eq("org_id", orgId);
   if (error) throw new Error(`product lookup failed: ${error.message}`);
@@ -38,7 +62,7 @@ export async function applyInventoryRows(db: Db, orgId: string, rows: InventoryR
       .from("products")
       .update({
         stock_qty: row.qty,
-        stock_status: stockStatusFor(row.qty),
+        stock_status: stockStatusFor(row.qty, rules),
         updated_at: new Date().toISOString(),
       })
       .eq("id", productId);
