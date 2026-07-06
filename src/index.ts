@@ -2,6 +2,7 @@ import cron from "node-cron";
 import { loadConfig } from "./config.js";
 import { createDb } from "./db.js";
 import { pollAllEndpoints } from "./files/poller.js";
+import { processOutbox } from "./hub/outbox.js";
 import { buildServer } from "./server.js";
 
 const config = loadConfig();
@@ -23,6 +24,8 @@ async function runPollCycle() {
         "file endpoint polled",
       );
     }
+    const delivered = await processOutbox(db);
+    if (Object.keys(delivered).length) app.log.info(delivered, "hub outbox processed");
   } catch (err) {
     app.log.error({ err }, "poll cycle failed");
   } finally {

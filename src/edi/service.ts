@@ -1,4 +1,6 @@
 import type { Db } from "../db.js";
+import { getHubConnection } from "../hub/connector.js";
+import { enqueueDelivery } from "../hub/outbox.js";
 import {
   DEFAULT_QUALIFIER_PRIORITY,
   getEdiPartnerMapping,
@@ -279,6 +281,19 @@ export async function processInboundInterchange(
       related_order_id: orderIds[0] ?? null,
     })
     .eq("id", messageId);
+
+  // Hub-connected orgs: forward the validated interchange to the hub's API
+  // (edi.receive) via the outbox. Local order rows are staging; the hub is
+  // the system of record.
+  if (hasContentSets) {
+    try {
+      const conn = await getHubConnection(db, orgId);
+      if (conn) await enqueueDelivery(db, orgId, "edi.receive", { document: raw }, messageId);
+    } catch (err) {
+      // Forwarding is best-effort here; the outbox sweep will retry.
+    }
+  }
+
   return { messageId, transactionSet, status: "processed", error: null, orderIds, ack997Id, acknowledged };
 }
 

@@ -9,6 +9,8 @@ import type { Db } from "./db.js";
 import { applyInventoryRows } from "./domain/inventory.js";
 import { applyDynamicRows, type IngestTarget } from "./dynamic.js";
 import { processInboundInterchange } from "./edi/service.js";
+import { callHub, getHubConnection, touchConnection } from "./hub/connector.js";
+import { enqueueDelivery } from "./hub/outbox.js";
 import { getExposedObjects, getStockStatusRules } from "./mappings.js";
 import { registerAdminRoutes } from "./routes/admin.js";
 
@@ -35,6 +37,14 @@ export function buildServer(config: Config, db: Db): FastifyInstance {
 
   app.get("/v1/products", { preHandler: [authenticate, requireScope("products:read")] }, async (req) => {
     const orgId = req.apiClient!.org_id;
+    // Hub-connected orgs proxy the hub's API; the hub stays the system of record.
+    const conn = await getHubConnection(db, orgId);
+    if (conn) {
+      const result = await callHub(conn, "products.list");
+      await touchConnection(db, conn, result.ok ? null : result.error ?? null);
+      if (!result.ok) throw new Error(`hub products.list failed: ${result.error}`);
+      return { ok: true, ...(result.data as object) };
+    }
     const { data, error } = await db
       .from("products")
       .select("sku, name, status, stock_qty, stock_status, bin_location")
@@ -50,6 +60,13 @@ export function buildServer(config: Config, db: Db): FastifyInstance {
     { preHandler: [authenticate, requireScope("orders:read")] },
     async (req) => {
       const orgId = req.apiClient!.org_id;
+      const conn = await getHubConnection(db, orgId);
+      if (conn) {
+        const result = await callHub(conn, "orders.list", req.query.status ? { status: req.query.status } : {});
+        await touchConnection(db, conn, result.ok ? null : result.error ?? null);
+        if (!result.ok) throw new Error(`hub orders.list failed: ${result.error}`);
+        return { ok: true, ...(result.data as object) };
+      }
       let query = db
         .from("purchase_orders")
         .select(
@@ -83,6 +100,18 @@ export function buildServer(config: Config, db: Db): FastifyInstance {
     async (req, reply) => {
       const orgId = req.apiClient!.org_id;
       const key = req.params.idOrPoNumber;
+      const conn = await getHubConnection(db, orgId);
+      if (conn) {
+        const payload = UUID_RE.test(key) ? { order_id: key } : { po_number: key };
+        const result = await callHub(conn, "orders.ack", payload);
+        await touchConnection(db, conn, result.ok ? null : result.error ?? null);
+        if (!result.ok) {
+          req.apiError = result.error ?? "hub ack failed";
+          const status = result.status === 404 ? 404 : 502;
+          return reply.code(status).send({ ok: false, status, error: result.error ?? "hub ack failed" });
+        }
+        return { ok: true, ...(result.data as object) };
+      }
       let query = db
         .from("purchase_orders")
         .update({ status: "confirmed", confirmed_at: new Date().toISOString(), updated_at: new Date().toISOString() })
@@ -113,6 +142,20 @@ export function buildServer(config: Config, db: Db): FastifyInstance {
         .map((r) => ({ sku: String(r.sku ?? "").trim(), qty: Number(r.qty) }))
         .filter((r) => r.sku && Number.isFinite(r.qty))
         .map((r) => ({ sku: r.sku, qty: Math.trunc(r.qty) }));
+      const conn = await getHubConnection(db, orgId);
+      if (conn) {
+        try {
+          const result = await callHub(conn, "inventory.push", { rows: clean });
+          await touchConnection(db, conn, result.ok ? null : result.error ?? null);
+          if (!result.ok) throw new Error(result.error ?? `hub returned status ${result.status}`);
+          return { ok: true, ...(result.data as object) };
+        } catch (err) {
+          // Hub unreachable: park in the outbox and accept the push.
+          const deliveryId = await enqueueDelivery(db, orgId, "inventory.push", { rows: clean });
+          req.log.warn({ err }, "hub unreachable, inventory push queued");
+          return reply.code(202).send({ ok: true, queued: true, delivery_id: deliveryId });
+        }
+      }
       const rules = await getStockStatusRules(db, orgId);
       const result = await applyInventoryRows(db, orgId, clean, rules);
       return { ok: true, updated: result.updated, unknown_skus: result.unknownSkus };

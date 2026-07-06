@@ -2,6 +2,8 @@ import { createHash, randomBytes } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import type { Config } from "../config.js";
 import type { Db } from "../db.js";
+import { getHubConnection, mw, syncCatalog, testConnection } from "../hub/connector.js";
+import { processOutbox, requeueDelivery } from "../hub/outbox.js";
 import { makeAdminGuard } from "./admin.js";
 
 /**
@@ -312,6 +314,94 @@ export function registerAdminApi(app: FastifyInstance, config: Config, db: Db) {
     if (error) throw new Error(error.message);
     if (!data) return reply.code(404).send({ ok: false, error: "message not found" });
     return { ok: true, message: data };
+  });
+
+  // ── Hub connections + delivery outbox ───────────────────────────────────────
+
+  app.get("/admin/api/hub-connections", opts, async () => {
+    const { data, error } = await mw(db, "hub_connections")
+      .select("id, org_id, name, hub_url, is_active, last_ok_at, last_error, created_at")
+      .order("created_at", { ascending: false });
+    if (error) throw new Error(error.message);
+    return { ok: true, connections: data ?? [] };
+  });
+
+  app.post<{ Body: { org_id?: string; name?: string; hub_url?: string; anon_key?: string; api_key?: string } }>(
+    "/admin/api/hub-connections",
+    opts,
+    async (req, reply) => {
+      const { org_id, name, hub_url, anon_key, api_key } = req.body ?? {};
+      if (!org_id || !hub_url || !anon_key || !api_key) {
+        return reply.code(400).send({ ok: false, error: "org_id, hub_url, anon_key, api_key required" });
+      }
+      const { data, error } = await mw(db, "hub_connections")
+        .upsert(
+          { org_id, name: name || "tread-sync-hub", hub_url, anon_key, api_key, is_active: true, updated_at: new Date().toISOString() },
+          { onConflict: "org_id" },
+        )
+        .select("id")
+        .single();
+      if (error) throw new Error(error.message);
+      return { ok: true, id: data.id };
+    },
+  );
+
+  app.patch<{ Params: { id: string }; Body: Record<string, unknown> }>(
+    "/admin/api/hub-connections/:id",
+    opts,
+    async (req) => {
+      const allowed = ["name", "hub_url", "anon_key", "api_key", "is_active"];
+      const patch = Object.fromEntries(
+        Object.entries(req.body ?? {}).filter(([k, v]) => allowed.includes(k) && v !== "" && v !== "•••"),
+      );
+      const { error } = await mw(db, "hub_connections")
+        .update({ ...patch, updated_at: new Date().toISOString() })
+        .eq("id", req.params.id);
+      if (error) throw new Error(error.message);
+      return { ok: true };
+    },
+  );
+
+  app.post<{ Params: { orgId: string } }>("/admin/hub/test/:orgId", opts, async (req, reply) => {
+    const conn = await getHubConnection(db, req.params.orgId);
+    if (!conn) return reply.code(404).send({ ok: false, error: "no active hub connection for org" });
+    const result = await testConnection(db, conn);
+    return { ok: result.ok, status: result.status, products: result.products, error: result.error ?? null };
+  });
+
+  app.post<{ Params: { orgId: string } }>("/admin/hub/sync-catalog/:orgId", opts, async (req, reply) => {
+    const conn = await getHubConnection(db, req.params.orgId);
+    if (!conn) return reply.code(404).send({ ok: false, error: "no active hub connection for org" });
+    const result = await syncCatalog(db, conn);
+    return { ok: !result.error, ...result };
+  });
+
+  app.get<{ Querystring: { status?: string; org_id?: string; limit?: string } }>(
+    "/admin/api/deliveries",
+    opts,
+    async (req) => {
+      let query = mw(db, "hub_deliveries")
+        .select("id, org_id, resource, status, attempts, next_at, last_error, created_at, delivered_at, related_message_id")
+        .order("created_at", { ascending: false })
+        .limit(Math.min(Number(req.query.limit) || 100, 500));
+      if (req.query.status) query = query.eq("status", req.query.status);
+      if (req.query.org_id) query = query.eq("org_id", req.query.org_id);
+      const { data, error } = await query;
+      if (error) throw new Error(error.message);
+      return { ok: true, deliveries: data ?? [] };
+    },
+  );
+
+  app.post("/admin/hub/outbox/process", opts, async () => {
+    const outcomes = await processOutbox(db);
+    return { ok: true, outcomes };
+  });
+
+  app.post<{ Params: { id: string } }>("/admin/hub/deliveries/:id/retry", opts, async (req, reply) => {
+    const found = await requeueDelivery(db, req.params.id);
+    if (!found) return reply.code(404).send({ ok: false, error: "delivery not found or not retryable" });
+    const outcomes = await processOutbox(db);
+    return { ok: true, outcomes };
   });
 
   // ── Request logs + integration runs ─────────────────────────────────────────

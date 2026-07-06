@@ -136,6 +136,7 @@ const VIEWS = {
   partners: { label: "EDI Partners", render: viewPartners },
   messages: { label: "EDI Messages", render: viewMessages },
   endpoints: { label: "File Endpoints", render: viewEndpoints },
+  hub: { label: "Hub Connection", render: viewHub },
   preview: { label: "Preview / Dry-run", render: viewPreview },
   settings: { label: "Org Settings", render: viewSettings },
   logs: { label: "Logs & Runs", render: viewLogs },
@@ -526,6 +527,97 @@ async function showRetryQueue(ep) {
       "Dead-letter queue is empty."),
     h("div", { class: "actions" }, h("button", { class: "secondary", onclick: () => close() }, "Close")));
   const { close } = modal(`Retry queue — ${ep.name}`, content, { wide: true });
+}
+
+// ── Hub connection ────────────────────────────────────────────────────────────
+
+async function viewHub() {
+  const { connections } = await api("/admin/api/hub-connections");
+  const rows = connections.map((c) => h("tr", {},
+    h("td", {}, c.name, h("div", { class: "muted" }, c.hub_url)),
+    h("td", {}, orgName(c.org_id)),
+    h("td", {}, badge(c.is_active ? "active" : "inactive")),
+    h("td", {}, c.last_ok_at ? h("span", {}, badge("ok"), " ", fmtDate(c.last_ok_at)) : h("span", { class: "muted" }, "never"),
+      c.last_error ? h("div", { class: "muted", style: "color:var(--err)" }, c.last_error.slice(0, 90)) : null),
+    h("td", {},
+      actionBtn("Test", async () => {
+        const r = await api(`/admin/hub/test/${c.org_id}`, { method: "POST" });
+        toast(r.ok ? `Connected — hub returned ${r.products} product(s)` : `Failed: ${r.error}`, !r.ok);
+        route();
+      }), " ",
+      actionBtn("Sync catalog", async () => {
+        const r = await api(`/admin/hub/sync-catalog/${c.org_id}`, { method: "POST" });
+        toast(r.ok ? `Catalog synced: ${r.synced} product(s)` : `Failed: ${r.error}`, !r.ok);
+      }), " ",
+      actionBtn("Edit", () => editHubConnection(c)), " ",
+      actionBtn(c.is_active ? "Disable" : "Enable", async () => {
+        await api(`/admin/api/hub-connections/${c.id}`, { method: "PATCH", body: { is_active: !c.is_active } });
+        toast("Connection updated"); route();
+      }, c.is_active ? "danger small" : "secondary small"))));
+
+  const deliveriesWrap = h("div", {});
+  async function loadDeliveries() {
+    const { deliveries } = await api("/admin/api/deliveries?limit=50");
+    deliveriesWrap.replaceChildren(
+      h("h2", {}, "Delivery outbox"),
+      h("p", { class: "sub" }, "Domain payloads bound for the hub. Unsupported = the hub's API doesn't accept that resource yet; kept for replay."),
+      h("div", { class: "toolbar" },
+        actionBtn("Process outbox now", async () => {
+          const r = await api("/admin/hub/outbox/process", { method: "POST" });
+          toast(`Outbox: ${JSON.stringify(r.outcomes)}`); loadDeliveries();
+        }, "")),
+      table(["When", "Org", "Resource", "Status", "Attempts", "Last error", ""],
+        deliveries.map((d) => h("tr", {},
+          h("td", {}, fmtDate(d.created_at)),
+          h("td", {}, orgName(d.org_id)),
+          h("td", {}, badge(d.resource)),
+          h("td", {}, h("span", { class: `badge ${d.status === "delivered" ? "ok" : d.status === "pending" ? "info" : d.status === "unsupported" ? "warn" : "err"}` }, d.status)),
+          h("td", {}, String(d.attempts)),
+          h("td", { class: "muted" }, d.last_error ? d.last_error.slice(0, 70) : ""),
+          h("td", {}, d.status !== "delivered"
+            ? actionBtn("Retry", async () => {
+                await api(`/admin/hub/deliveries/${d.id}/retry`, { method: "POST" });
+                toast("Retried"); loadDeliveries();
+              })
+            : null))),
+        "Outbox is empty."));
+  }
+  await loadDeliveries();
+
+  return h("div", {},
+    h("h1", {}, "Hub Connection"),
+    h("p", { class: "sub" }, "The middleware's only line to the hub app: its public API, using a hub-issued key the hub can scope and revoke. No shared database."),
+    h("div", { class: "toolbar" }, h("div", { class: "spacer" }), h("button", { onclick: () => editHubConnection(null) }, "+ New connection")),
+    table(["Connection", "Org", "Status", "Last contact", ""], rows, "No hub connection configured — routes run in local mode."),
+    deliveriesWrap);
+}
+
+function editHubConnection(c) {
+  const org = orgSelect(c?.org_id);
+  const name = h("input", { value: c?.name || "tread-sync-hub" });
+  const url = h("input", { value: c?.hub_url || "", placeholder: "https://<hub-project>.supabase.co" });
+  const anonKey = h("input", { type: "password", placeholder: c ? "unchanged" : "hub anon key" });
+  const apiKey = h("input", { type: "password", placeholder: c ? "unchanged" : "hub-issued API key (trk_live_…)" });
+  const { close } = modal(c ? "Edit hub connection" : "New hub connection", h("div", {},
+    h("div", { class: "row" }, field("Organization", org), field("Name", name)),
+    field("Hub URL", url),
+    field("Hub anon key", anonKey, "PostgREST apikey header — public key of the hub project."),
+    field("Hub API key", apiKey, "Issued by the hub (api_clients): scoped, rate-limited, revocable."),
+    h("div", { class: "actions" },
+      h("button", { class: "secondary", onclick: () => close() }, "Cancel"),
+      actionBtn("Save", async () => {
+        if (c) {
+          await api(`/admin/api/hub-connections/${c.id}`, { method: "PATCH", body: {
+            name: name.value.trim(), hub_url: url.value.trim(), anon_key: anonKey.value, api_key: apiKey.value,
+          }});
+        } else {
+          await api("/admin/api/hub-connections", { method: "POST", body: {
+            org_id: org.value, name: name.value.trim(), hub_url: url.value.trim(),
+            anon_key: anonKey.value, api_key: apiKey.value,
+          }});
+        }
+        close(); toast("Connection saved"); route();
+      }, ""))));
 }
 
 // ── Preview / dry-run ─────────────────────────────────────────────────────────

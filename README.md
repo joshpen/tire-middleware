@@ -1,25 +1,38 @@
 # tread-sync-gateway
 
-Integration runtime companion to **tread-sync-hub** (B2B tire-industry platform on
-Supabase). This service owns inbound/outbound integration traffic: the partner
-REST API, EDI X12, CSV file routing, and SFTP polling.
+Standalone iPaaS layer for **tread-sync-hub** (B2B tire-industry platform).
+This service owns all inbound/outbound integration traffic — partner REST API,
+EDI X12, CSV file routing, SFTP polling — and connects to the hub app only
+through the hub's public API. **No shared database.**
 
-## Schema contract
+## Architecture
 
-The service shares the platform's Supabase Postgres but **owns no schema** —
-never add migrations here; the tread-sync-hub repo owns all DDL. These tables
-are the contract (config store + message bus):
+```
+partners ──[REST / EDI X12 / SFTP / HTTPS]──▶ tread-sync-gateway ──[hub public API]──▶ tread-sync-hub
+                                              (own Supabase DB,     key-authenticated,   (own DB, own repo,
+                                               own schema)          scoped, revocable     never touched here)
+```
 
-`api_clients` · `api_request_logs` · `edi_partners` · `edi_messages` ·
-`file_endpoints` · `integration_runs` — plus domain tables `products`,
-`purchase_orders`, `purchase_order_lines`, `dealer_inventory`, `product_prices`,
-`shipments`, `order_invoices`.
+- **The middleware owns its own Supabase project and schema** (migrations in
+  `supabase/migrations/`): API clients, EDI partners, message ledger, file
+  endpoints, integration runs, hub connections, delivery outbox, and a local
+  product-catalog cache (synced from the hub) for SKU resolution.
+- **The hub is reached only through its `api_gateway` RPC** with a hub-issued
+  API key the hub can scope, rate-limit, revoke, and audit. Resources
+  available today: `products.list`, `orders.list`, `orders.ack`,
+  `inventory.push`, `edi.receive`. The hub repo is never modified from here.
+- **Dual mode:** orgs with an active `hub_connections` row proxy domain
+  reads/writes to the hub API; orgs without one run against local tables
+  (standalone/staging mode).
+- **Delivery outbox** (`hub_deliveries`): payloads bound for the hub retry
+  with exponential backoff; resources the hub's API doesn't accept yet park
+  as `unsupported` and can be replayed once the hub grows the endpoint.
+- Validated inbound EDI is staged locally (orders + ledger) and the raw
+  interchange is forwarded to the hub via `edi.receive`.
 
-This service is fully self-contained: `src/types/supabase.ts` is a vendored
-copy of the platform's generated types (refresh with
-`supabase gen types --linked > src/types/supabase.ts` when the contract
-changes), and `npm run seed` creates all the data verification needs — no
-other repo is required to build, test, or run the gateway.
+Fully self-contained: `src/types/supabase.ts` is a vendored types snapshot,
+and `npm run seed` creates all the data verification needs — no other repo is
+required to build, test, or run the gateway.
 
 ## Stack
 
