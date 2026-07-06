@@ -2,7 +2,7 @@
 "use strict";
 
 const $app = document.getElementById("app");
-const SCOPES = ["products:read", "orders:read", "orders:write", "inventory:write", "edi:write"];
+const SCOPES = ["products:read", "products:write", "orders:read", "orders:write", "inventory:write", "edi:write", "warranty:read", "warranty:write"];
 let orgs = [];
 
 // ── infrastructure ────────────────────────────────────────────────────────────

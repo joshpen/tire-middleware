@@ -118,10 +118,13 @@ await ensurePartner(sellerOrgId, buyerOrgId);
 
 const fullKey = await createClient(sellerOrgId, userId, "gateway smoke (full)", [
   "products:read",
+  "products:write",
   "orders:read",
   "orders:write",
   "inventory:write",
   "edi:write",
+  "warranty:read",
+  "warranty:write",
 ]);
 const limitedKey = await createClient(sellerOrgId, userId, "gateway smoke (read-only)", ["products:read"]);
 

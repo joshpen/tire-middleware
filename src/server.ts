@@ -6,12 +6,12 @@ import { registerAdminApi } from "./routes/adminApi.js";
 import { registerApiKeyAuth } from "./auth/apiKey.js";
 import type { Config } from "./config.js";
 import type { Db } from "./db.js";
-import { applyInventoryRows } from "./domain/inventory.js";
+import * as resources from "./domain/resources.js";
+import type { Actor } from "./domain/resources.js";
 import { applyDynamicRows, type IngestTarget } from "./dynamic.js";
 import { processInboundInterchange } from "./edi/service.js";
-import { callHub, getHubConnection, touchConnection } from "./hub/connector.js";
-import { enqueueDelivery } from "./hub/outbox.js";
-import { getExposedObjects, getStockStatusRules } from "./mappings.js";
+import { getExposedObjects } from "./mappings.js";
+import { registerMcp } from "./mcp.js";
 import { registerAdminRoutes } from "./routes/admin.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -35,131 +35,109 @@ export function buildServer(config: Config, db: Db): FastifyInstance {
 
   app.get("/healthz", async () => ({ ok: true, service: "tread-sync-gateway" }));
 
-  app.get("/v1/products", { preHandler: [authenticate, requireScope("products:read")] }, async (req) => {
-    const orgId = req.apiClient!.org_id;
-    // Hub-connected orgs proxy the hub's API; the hub stays the system of record.
-    const conn = await getHubConnection(db, orgId);
-    if (conn) {
-      const result = await callHub(conn, "products.list");
-      await touchConnection(db, conn, result.ok ? null : result.error ?? null);
-      if (!result.ok) throw new Error(`hub products.list failed: ${result.error}`);
-      return { ok: true, ...(result.data as object) };
-    }
-    const { data, error } = await db
-      .from("products")
-      .select("sku, name, status, stock_qty, stock_status, bin_location")
-      .eq("org_id", orgId)
-      .eq("status", "active")
-      .order("sku");
-    if (error) throw new Error(`products query failed: ${error.message}`);
-    return { ok: true, products: data ?? [] };
+  // Management REST API: thin wrappers over the shared resource layer
+  // (src/domain/resources.ts) — the MCP tools use the same functions.
+
+  const actorOf = (req: { apiClient: { id: string; org_id: string; scopes: string[] } | null }): Actor => ({
+    clientId: req.apiClient!.id,
+    orgId: req.apiClient!.org_id,
+    scopes: req.apiClient!.scopes,
   });
 
-  app.get<{ Querystring: { status?: string } }>(
-    "/v1/orders",
-    { preHandler: [authenticate, requireScope("orders:read")] },
-    async (req) => {
-      const orgId = req.apiClient!.org_id;
-      const conn = await getHubConnection(db, orgId);
-      if (conn) {
-        const result = await callHub(conn, "orders.list", req.query.status ? { status: req.query.status } : {});
-        await touchConnection(db, conn, result.ok ? null : result.error ?? null);
-        if (!result.ok) throw new Error(`hub orders.list failed: ${result.error}`);
-        return { ok: true, ...(result.data as object) };
-      }
-      let query = db
-        .from("purchase_orders")
-        .select(
-          "id, po_number, status, total_amount, created_at, ship_to_address, buyer:organizations!purchase_orders_buyer_org_id_fkey(name), lines:purchase_order_lines(sku, name, quantity, unit_price)",
-        )
-        .eq("seller_org_id", orgId)
-        .order("created_at", { ascending: false })
-        .limit(50);
-      if (req.query.status) query = query.eq("status", req.query.status);
-      const { data, error } = await query;
-      if (error) throw new Error(`orders query failed: ${error.message}`);
-      return {
-        ok: true,
-        orders: (data ?? []).map((o) => ({
-          id: o.id,
-          po_number: o.po_number,
-          status: o.status,
-          total_amount: o.total_amount,
-          created_at: o.created_at,
-          buyer: o.buyer?.name ?? null,
-          ship_to: o.ship_to_address,
-          lines: o.lines,
-        })),
-      };
-    },
+  app.get("/v1/products", { preHandler: [authenticate] }, async (req) => ({
+    ok: true,
+    products: await resources.listProducts(db, actorOf(req)),
+  }));
+
+  app.get<{ Params: { sku: string } }>("/v1/products/:sku", { preHandler: [authenticate] }, async (req) => ({
+    ok: true,
+    product: await resources.getProduct(db, actorOf(req), req.params.sku),
+  }));
+
+  app.post<{ Body: resources.ProductInput }>("/v1/products", { preHandler: [authenticate] }, async (req) => ({
+    ok: true,
+    ...(await resources.upsertProduct(db, actorOf(req), req.body ?? ({} as resources.ProductInput))),
+  }));
+
+  app.patch<{ Params: { sku: string }; Body: Omit<resources.ProductInput, "sku"> }>(
+    "/v1/products/:sku",
+    { preHandler: [authenticate] },
+    async (req) => ({
+      ok: true,
+      ...(await resources.upsertProduct(db, actorOf(req), { ...(req.body ?? {}), sku: req.params.sku })),
+    }),
   );
+
+  app.get<{ Querystring: { status?: string } }>("/v1/orders", { preHandler: [authenticate] }, async (req) => ({
+    ok: true,
+    orders: await resources.listOrders(db, actorOf(req), req.query.status),
+  }));
+
+  app.get<{ Params: { idOrPoNumber: string } }>(
+    "/v1/orders/:idOrPoNumber",
+    { preHandler: [authenticate] },
+    async (req) => ({ ok: true, order: await resources.getOrder(db, actorOf(req), req.params.idOrPoNumber) }),
+  );
+
+  app.post<{ Body: resources.OrderInput }>("/v1/orders", { preHandler: [authenticate] }, async (req, reply) => {
+    const order = await resources.createOrder(db, actorOf(req), req.body ?? ({ lines: [] } as resources.OrderInput));
+    return reply.code(201).send({ ok: true, order });
+  });
 
   app.post<{ Params: { idOrPoNumber: string } }>(
     "/v1/orders/:idOrPoNumber/ack",
-    { preHandler: [authenticate, requireScope("orders:write")] },
-    async (req, reply) => {
-      const orgId = req.apiClient!.org_id;
-      const key = req.params.idOrPoNumber;
-      const conn = await getHubConnection(db, orgId);
-      if (conn) {
-        const payload = UUID_RE.test(key) ? { order_id: key } : { po_number: key };
-        const result = await callHub(conn, "orders.ack", payload);
-        await touchConnection(db, conn, result.ok ? null : result.error ?? null);
-        if (!result.ok) {
-          req.apiError = result.error ?? "hub ack failed";
-          const status = result.status === 404 ? 404 : 502;
-          return reply.code(status).send({ ok: false, status, error: result.error ?? "hub ack failed" });
-        }
-        return { ok: true, ...(result.data as object) };
-      }
-      let query = db
-        .from("purchase_orders")
-        .update({ status: "confirmed", confirmed_at: new Date().toISOString(), updated_at: new Date().toISOString() })
-        .eq("seller_org_id", orgId)
-        .eq("status", "submitted");
-      query = UUID_RE.test(key) ? query.eq("id", key) : query.eq("po_number", key);
-      const { data, error } = await query.select("id, po_number");
-      if (error) throw new Error(`ack update failed: ${error.message}`);
-      if (!data || data.length === 0) {
-        req.apiError = "no submitted order matched";
-        return reply.code(404).send({ ok: false, status: 404, error: "no submitted order matched" });
-      }
-      return { ok: true, acknowledged: data.length, orders: data };
-    },
+    { preHandler: [authenticate] },
+    async (req) => ({ ok: true, ...(await resources.ackOrder(db, actorOf(req), req.params.idOrPoNumber)) }),
+  );
+
+  app.patch<{ Params: { idOrPoNumber: string }; Body: { status?: string } }>(
+    "/v1/orders/:idOrPoNumber/status",
+    { preHandler: [authenticate] },
+    async (req) => ({
+      ok: true,
+      order: await resources.updateOrderStatus(db, actorOf(req), req.params.idOrPoNumber, req.body?.status ?? ""),
+    }),
   );
 
   app.post<{ Body: { rows?: { sku?: unknown; qty?: unknown }[] } }>(
     "/v1/inventory",
-    { preHandler: [authenticate, requireScope("inventory:write")] },
+    { preHandler: [authenticate] },
     async (req, reply) => {
-      const orgId = req.apiClient!.org_id;
       const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
       if (!rows) {
         req.apiError = "body must be {rows:[{sku,qty}]}";
         return reply.code(400).send({ ok: false, status: 400, error: "body must be {rows:[{sku,qty}]}" });
       }
-      const clean = rows
-        .map((r) => ({ sku: String(r.sku ?? "").trim(), qty: Number(r.qty) }))
-        .filter((r) => r.sku && Number.isFinite(r.qty))
-        .map((r) => ({ sku: r.sku, qty: Math.trunc(r.qty) }));
-      const conn = await getHubConnection(db, orgId);
-      if (conn) {
-        try {
-          const result = await callHub(conn, "inventory.push", { rows: clean });
-          await touchConnection(db, conn, result.ok ? null : result.error ?? null);
-          if (!result.ok) throw new Error(result.error ?? `hub returned status ${result.status}`);
-          return { ok: true, ...(result.data as object) };
-        } catch (err) {
-          // Hub unreachable: park in the outbox and accept the push.
-          const deliveryId = await enqueueDelivery(db, orgId, "inventory.push", { rows: clean });
-          req.log.warn({ err }, "hub unreachable, inventory push queued");
-          return reply.code(202).send({ ok: true, queued: true, delivery_id: deliveryId });
-        }
-      }
-      const rules = await getStockStatusRules(db, orgId);
-      const result = await applyInventoryRows(db, orgId, clean, rules);
-      return { ok: true, updated: result.updated, unknown_skus: result.unknownSkus };
+      const result = await resources.pushInventory(db, actorOf(req), rows as { sku: string; qty: number }[]);
+      if ((result as { queued?: boolean }).queued) return reply.code(202).send({ ok: true, ...result });
+      return { ok: true, ...result };
     },
+  );
+
+  app.get<{ Querystring: { status?: string } }>(
+    "/v1/warranty-claims",
+    { preHandler: [authenticate] },
+    async (req) => ({ ok: true, claims: await resources.listClaims(db, actorOf(req), req.query.status) }),
+  );
+
+  app.get<{ Params: { idOrNumber: string } }>(
+    "/v1/warranty-claims/:idOrNumber",
+    { preHandler: [authenticate] },
+    async (req) => ({ ok: true, claim: await resources.getClaim(db, actorOf(req), req.params.idOrNumber) }),
+  );
+
+  app.post<{ Body: resources.ClaimInput }>("/v1/warranty-claims", { preHandler: [authenticate] }, async (req, reply) => {
+    const claim = await resources.createClaim(db, actorOf(req), req.body ?? ({} as resources.ClaimInput));
+    return reply.code(201).send({ ok: true, claim });
+  });
+
+  app.patch<{ Params: { idOrNumber: string }; Body: { status?: string; resolution?: string } }>(
+    "/v1/warranty-claims/:idOrNumber",
+    { preHandler: [authenticate] },
+    async (req) => ({
+      ok: true,
+      claim: await resources.updateClaim(db, actorOf(req), req.params.idOrNumber, req.body ?? {}),
+    }),
   );
 
   app.post(
@@ -276,6 +254,7 @@ export function buildServer(config: Config, db: Db): FastifyInstance {
 
   registerAdminRoutes(app, config, db);
   registerAdminApi(app, config, db);
+  registerMcp(app, db);
 
   // Admin dashboard (static SPA) at /ui.
   app.register(fastifyStatic, {

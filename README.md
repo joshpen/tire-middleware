@@ -62,6 +62,33 @@ All data is org-scoped by the key's `org_id`.
 | `POST /v1/inventory` | `inventory:write` | `{rows:[{sku,qty}]}` → `stock_qty`; status ≤0 backorder, ≤8 low_stock |
 | `POST /v1/edi` | `edi:write` | raw X12 body → stored in `edi_messages`, then processed |
 | `GET/POST /v1/objects/:key` | config-declared | dynamic objects exposed via `exposed_objects` |
+| `GET /v1/products/:sku` | `products:read` | one product |
+| `POST /v1/products` · `PATCH /v1/products/:sku` | `products:write` | create / update products |
+| `GET /v1/orders/:idOrPo` | `orders:read` | order detail with lines |
+| `POST /v1/orders` | `orders:write` | create an order (staged + forwarded to hub) |
+| `PATCH /v1/orders/:idOrPo/status` | `orders:write` | confirmed/processing/shipped/delivered/cancelled |
+| `GET /v1/warranty-claims[?status=]` · `GET …/:idOrNumber` | `warranty:read` | list / track claims |
+| `POST /v1/warranty-claims` · `PATCH …/:idOrNumber` | `warranty:write` | file / adjudicate claims |
+
+## MCP (agent access)
+
+`POST /mcp` is a stateless Streamable-HTTP MCP endpoint using the same bearer
+API keys (same org scoping and scopes, enforced per tool). Point any MCP
+client at it:
+
+```json
+{ "url": "https://<gateway>/mcp",
+  "headers": { "Authorization": "Bearer trk_live_…" } }
+```
+
+Tools: `list_products`, `get_product`, `upsert_product`, `list_orders`,
+`get_order`, `create_order`, `acknowledge_order`, `update_order_status`,
+`push_inventory`, `list_warranty_claims`, `get_warranty_claim`,
+`create_warranty_claim`, `update_warranty_claim`. REST routes and MCP tools
+are thin wrappers over the same resource layer (`src/domain/resources.ts`),
+so behavior is identical — including hub proxying and outbox staging for
+resources the hub's API doesn't accept yet (`orders.create`,
+`products.upsert`, `warranty.claim.*` park as `unsupported` for replay).
 | `POST /admin/poll/:endpointId` | service-role key | manual file-endpoint poll |
 | `POST /admin/preview/parse` | service-role key | dry-run classify/parse/resolve, no writes |
 | `POST /admin/preview/fetch/:endpointId` | service-role key | fetch sample files, nothing marked processed |
