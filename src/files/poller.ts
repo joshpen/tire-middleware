@@ -4,6 +4,13 @@ import { processInboundInterchange } from "../edi/service.js";
 import { applyDynamicRows } from "../dynamic.js";
 import { getStockStatusRules } from "../mappings.js";
 import { classifyContent, parseGenericCsv, parseInventoryCsv, parsePriceCsv, type CsvMapping } from "./csv.js";
+import {
+  policyFromConfig,
+  readRetryState,
+  recordFailure,
+  recordSuccess,
+  skippedKeys,
+} from "./retry.js";
 import { ensureRunContext, finishRun, startRun } from "./runs.js";
 import {
   fetchHttpsFile,
@@ -93,13 +100,17 @@ export async function pollEndpoint(db: Db, endpoint: EndpointRow): Promise<PollO
   const config = (endpoint.config ?? {}) as Record<string, unknown>;
   const processed = new Set<string>(Array.isArray(config.processed) ? (config.processed as string[]) : []);
   const processedNow: string[] = [];
+  const retryState = readRetryState(config);
+  const policy = policyFromConfig(config);
 
   try {
+    // Skip already-ingested files plus anything backing off or dead-lettered.
+    const skip = new Set([...processed, ...skippedKeys(retryState)]);
     let files: RemoteFile[];
     if (endpoint.kind === "sftp") {
-      files = await fetchSftpFiles(config as unknown as SftpEndpointConfig, processed);
+      files = await fetchSftpFiles(config as unknown as SftpEndpointConfig, skip);
     } else if (endpoint.kind === "https") {
-      files = await fetchHttpsFile(config as unknown as HttpsEndpointConfig, processed);
+      files = await fetchHttpsFile(config as unknown as HttpsEndpointConfig, skip);
     } else {
       throw new Error(`unsupported endpoint kind ${endpoint.kind}`);
     }
@@ -109,8 +120,16 @@ export async function pollEndpoint(db: Db, endpoint: EndpointRow): Promise<PollO
       try {
         outcome.recordsProcessed += await ingestFile(db, endpoint, file);
         processedNow.push(file.key);
+        recordSuccess(retryState, file.key);
       } catch (err) {
-        outcome.errors.push(`${file.name}: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        const disposition = recordFailure(retryState, file.key, message, policy);
+        const attempts = disposition === "retry" ? retryState.retry_state[file.key]!.attempts : policy.maxRetries;
+        outcome.errors.push(
+          disposition === "dead_letter"
+            ? `${file.name}: dead-lettered after ${attempts} attempts: ${message}`
+            : `${file.name}: attempt ${attempts}/${policy.maxRetries} failed, will retry: ${message}`,
+        );
       }
     }
   } catch (err) {
@@ -120,12 +139,17 @@ export async function pollEndpoint(db: Db, endpoint: EndpointRow): Promise<PollO
 
   if (outcome.status !== "failed" && outcome.errors.length > 0) outcome.status = "failed";
 
-  // Persist processed-file memory and poll status on the endpoint row.
+  // Persist processed-file memory, retry state, and poll status on the endpoint row.
   const newProcessed = [...processed, ...processedNow].slice(-PROCESSED_KEEP);
   const { error: endpointError } = await db
     .from("file_endpoints")
     .update({
-      config: { ...config, processed: newProcessed },
+      config: {
+        ...config,
+        processed: newProcessed,
+        retry_state: retryState.retry_state,
+        dead_letter: retryState.dead_letter,
+      },
       last_polled_at: new Date().toISOString(),
       last_error: outcome.errors.length ? outcome.errors.join("; ").slice(0, 1000) : null,
       updated_at: new Date().toISOString(),

@@ -1,7 +1,8 @@
 import type { FastifyInstance, preHandlerHookHandler } from "fastify";
 import type { Config } from "../config.js";
 import type { Db } from "../db.js";
-import { resolve850Lines } from "../edi/service.js";
+import { processInboundInterchange, resolve850Lines } from "../edi/service.js";
+import { readRetryState, requeue } from "../files/retry.js";
 import { parse850 } from "../edi/sets.js";
 import { parseInterchange, type X12Interchange } from "../edi/x12.js";
 import { planDynamicRows } from "../dynamic.js";
@@ -56,6 +57,98 @@ export function registerAdminRoutes(app: FastifyInstance, config: Config, db: Db
       if (!endpoint) return reply.code(404).send({ ok: false, status: 404, error: "endpoint not found" });
       const outcome = await pollEndpoint(db, endpoint);
       return { ok: outcome.status === "success", ...outcome };
+    },
+  );
+
+  // ── Retry queue ─────────────────────────────────────────────────────────────
+
+  app.get<{ Params: { endpointId: string } }>(
+    "/admin/retry/:endpointId",
+    { preHandler: [requireServiceRole] },
+    async (req, reply) => {
+      const { data: endpoint, error } = await db
+        .from("file_endpoints")
+        .select("id, name, config")
+        .eq("id", req.params.endpointId)
+        .maybeSingle();
+      if (error) throw new Error(`endpoint lookup failed: ${error.message}`);
+      if (!endpoint) return reply.code(404).send({ ok: false, status: 404, error: "endpoint not found" });
+      const state = readRetryState((endpoint.config ?? {}) as Record<string, unknown>);
+      return { ok: true, endpoint: { id: endpoint.id, name: endpoint.name }, ...state };
+    },
+  );
+
+  app.post<{ Params: { endpointId: string }; Body: { key?: string } }>(
+    "/admin/requeue/:endpointId",
+    { preHandler: [requireServiceRole] },
+    async (req, reply) => {
+      const key = req.body?.key;
+      if (!key) return reply.code(400).send({ ok: false, status: 400, error: "body must include key" });
+      const { data: endpoint, error } = await db
+        .from("file_endpoints")
+        .select("id, config")
+        .eq("id", req.params.endpointId)
+        .maybeSingle();
+      if (error) throw new Error(`endpoint lookup failed: ${error.message}`);
+      if (!endpoint) return reply.code(404).send({ ok: false, status: 404, error: "endpoint not found" });
+      const config = (endpoint.config ?? {}) as Record<string, unknown>;
+      const state = readRetryState(config);
+      const had = requeue(state, key);
+      if (!had) return reply.code(404).send({ ok: false, status: 404, error: `no retry/dead-letter state for ${key}` });
+      const { error: updateError } = await db
+        .from("file_endpoints")
+        .update({
+          config: { ...config, retry_state: state.retry_state, dead_letter: state.dead_letter },
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", endpoint.id);
+      if (updateError) throw new Error(`requeue update failed: ${updateError.message}`);
+      return { ok: true, requeued: key };
+    },
+  );
+
+  // ── EDI operations ──────────────────────────────────────────────────────────
+
+  // Reprocess a stored inbound message in place (after a mapping/partner fix).
+  app.post<{ Params: { messageId: string } }>(
+    "/admin/edi/retry/:messageId",
+    { preHandler: [requireServiceRole] },
+    async (req, reply) => {
+      const { data: message, error } = await db
+        .from("edi_messages")
+        .select("id, org_id, direction, status, raw")
+        .eq("id", req.params.messageId)
+        .maybeSingle();
+      if (error) throw new Error(`message lookup failed: ${error.message}`);
+      if (!message) return reply.code(404).send({ ok: false, status: 404, error: "message not found" });
+      if (message.direction !== "inbound") {
+        return reply.code(400).send({ ok: false, status: 400, error: "only inbound messages can be reprocessed" });
+      }
+      const result = await processInboundInterchange(db, message.org_id, message.raw, message.id);
+      return { ok: result.status === "processed", ...result };
+    },
+  );
+
+  // 997 reconciliation report: outbound messages still waiting for a partner ack.
+  app.get<{ Querystring: { org_id?: string; older_than_minutes?: string } }>(
+    "/admin/edi/unacknowledged",
+    { preHandler: [requireServiceRole] },
+    async (req) => {
+      const olderThanMin = Number(req.query.older_than_minutes) || 0;
+      const cutoff = new Date(Date.now() - olderThanMin * 60_000).toISOString();
+      let query = db
+        .from("edi_messages")
+        .select("id, org_id, partner_id, transaction_set, control_number, status, created_at, related_order_id")
+        .eq("direction", "outbound")
+        .in("status", ["generated", "sent"])
+        .neq("transaction_set", "997")
+        .lte("created_at", cutoff)
+        .order("created_at", { ascending: true })
+        .limit(200);
+      if (req.query.org_id) query = query.eq("org_id", req.query.org_id);
+      const { data, error } = await query;
+      if (error) throw new Error(`unacknowledged query failed: ${error.message}`);
+      return { ok: true, count: (data ?? []).length, messages: data ?? [] };
     },
   );
 

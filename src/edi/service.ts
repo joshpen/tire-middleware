@@ -11,6 +11,7 @@ import {
   generate810,
   generate997,
   parse850,
+  parse997,
   type Edi850,
   type Edi850Line,
 } from "./sets.js";
@@ -69,6 +70,14 @@ async function storeOutbound(
   return data.id;
 }
 
+export interface Acknowledged {
+  message_id: string;
+  transaction_set: string;
+  control_number: string;
+  /** "accepted" | "accepted_with_errors" | "rejected" | "unmatched" */
+  disposition: string;
+}
+
 export interface InboundResult {
   messageId: string;
   transactionSet: string;
@@ -76,6 +85,73 @@ export interface InboundResult {
   error: string | null;
   orderIds: string[];
   ack997Id: string | null;
+  /** Outbound messages reconciled by inbound 997s in this interchange. */
+  acknowledged: Acknowledged[];
+}
+
+const AK5_DISPOSITION: Record<string, string> = {
+  A: "accepted",
+  E: "accepted_with_errors",
+  R: "rejected",
+  M: "rejected",
+  W: "rejected",
+  X: "rejected",
+};
+
+/**
+ * Applies one inbound 997 to the outbound ledger: each acknowledged
+ * transaction (AK2 set + AK1 group control) is matched to our outbound
+ * edi_messages row (control numbers are the 9-digit per-org sequence) and its
+ * status moves to `processed` (accepted) or `error` (rejected), stamping
+ * processed_at. Unmatched acknowledgments are reported, not dropped.
+ */
+export async function reconcile997(db: Db, orgId: string, txn: X12Transaction): Promise<Acknowledged[]> {
+  const ack = parse997(txn);
+  const control = String(parseInt(ack.groupControl, 10)).padStart(9, "0");
+  // Some 997s omit AK2 loops; fall back to the group-level result.
+  const entries = ack.acknowledged.length
+    ? ack.acknowledged.map((a) => ({ set: a.set, status: a.status }))
+    : [{ set: null as string | null, status: ack.groupStatus }];
+
+  const results: Acknowledged[] = [];
+  for (const entry of entries) {
+    let query = db
+      .from("edi_messages")
+      .select("id, transaction_set")
+      .eq("org_id", orgId)
+      .eq("direction", "outbound")
+      .eq("control_number", control);
+    if (entry.set) query = query.eq("transaction_set", entry.set);
+    const { data: outbound, error } = await query.limit(1);
+    if (error) throw new Error(`997 reconciliation lookup failed: ${error.message}`);
+    const match = outbound?.[0];
+    const disposition = AK5_DISPOSITION[entry.status] ?? "accepted";
+    if (!match) {
+      results.push({
+        message_id: "",
+        transaction_set: entry.set ?? "?",
+        control_number: control,
+        disposition: "unmatched",
+      });
+      continue;
+    }
+    const { error: updateError } = await db
+      .from("edi_messages")
+      .update(
+        disposition === "rejected"
+          ? { status: "error", error: `rejected by partner 997 (AK5 ${entry.status})`, processed_at: new Date().toISOString() }
+          : { status: "processed", processed_at: new Date().toISOString() },
+      )
+      .eq("id", match.id);
+    if (updateError) throw new Error(`997 reconciliation update failed: ${updateError.message}`);
+    results.push({
+      message_id: match.id,
+      transaction_set: match.transaction_set,
+      control_number: control,
+      disposition,
+    });
+  }
+  return results;
 }
 
 /**
@@ -87,7 +163,12 @@ export interface InboundResult {
  *      (PO1 qualifiers VN → products.sku, UP → products.barcode)
  *   4. generate + store a 997 back to the sender
  */
-export async function processInboundInterchange(db: Db, orgId: string, raw: string): Promise<InboundResult> {
+export async function processInboundInterchange(
+  db: Db,
+  orgId: string,
+  raw: string,
+  existingMessageId?: string,
+): Promise<InboundResult> {
   let interchange: X12Interchange | null = null;
   let transactionSet = "unknown";
   try {
@@ -97,27 +178,46 @@ export async function processInboundInterchange(db: Db, orgId: string, raw: stri
     // Stored below with a parse error.
   }
 
-  const { data: inserted, error: insertError } = await db
-    .from("edi_messages")
-    .insert({
-      org_id: orgId,
-      direction: "inbound",
-      transaction_set: transactionSet,
-      control_number: interchange?.control ?? null,
-      status: "received",
-      raw,
-    })
-    .select("id")
-    .single();
-  if (insertError) throw new Error(`failed to store inbound message: ${insertError.message}`);
-  const messageId = inserted.id;
+  let messageId: string;
+  if (existingMessageId) {
+    // Operator retry of a stored message: reuse the ledger row.
+    messageId = existingMessageId;
+    const { error } = await db
+      .from("edi_messages")
+      .update({ status: "received", error: null, processed_at: null })
+      .eq("id", messageId);
+    if (error) throw new Error(`failed to reset message for retry: ${error.message}`);
+  } else {
+    const { data: inserted, error: insertError } = await db
+      .from("edi_messages")
+      .insert({
+        org_id: orgId,
+        direction: "inbound",
+        transaction_set: transactionSet,
+        control_number: interchange?.control ?? null,
+        status: "received",
+        raw,
+      })
+      .select("id")
+      .single();
+    if (insertError) throw new Error(`failed to store inbound message: ${insertError.message}`);
+    messageId = inserted.id;
+  }
 
   const fail = async (message: string): Promise<InboundResult> => {
     await db
       .from("edi_messages")
       .update({ status: "error", error: message, processed_at: new Date().toISOString() })
       .eq("id", messageId);
-    return { messageId, transactionSet, status: "error", error: message, orderIds: [], ack997Id: null };
+    return {
+      messageId,
+      transactionSet,
+      status: "error",
+      error: message,
+      orderIds: [],
+      ack997Id: null,
+      acknowledged: [],
+    };
   };
 
   if (!interchange) return fail("document is not a parseable X12 interchange");
@@ -138,12 +238,19 @@ export async function processInboundInterchange(db: Db, orgId: string, raw: stri
   await db.from("edi_messages").update({ partner_id: partner.id }).eq("id", messageId);
 
   const orderIds: string[] = [];
+  const acknowledged: Acknowledged[] = [];
+  // A 997 is never acknowledged with another 997; only answer content sets.
+  const hasContentSets = interchange.groups.some((g) => g.transactions.some((t) => t.set !== "997"));
   try {
     const mapping = await getEdiPartnerMapping(db, orgId, partner.id);
     for (const group of interchange.groups) {
       for (const txn of group.transactions) {
+        if (txn.set === "997") {
+          acknowledged.push(...(await reconcile997(db, orgId, txn)));
+          continue;
+        }
         if (txn.set !== "850") {
-          throw new Error(`unsupported inbound transaction set ${txn.set} (only 850 is processed)`);
+          throw new Error(`unsupported inbound transaction set ${txn.set} (only 850 and 997 are processed)`);
         }
         if (!partner.partner_org_id) {
           throw new Error(`EDI partner "${partner.name}" is not linked to a platform org`);
@@ -155,15 +262,15 @@ export async function processInboundInterchange(db: Db, orgId: string, raw: stri
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     // Still acknowledge receipt: the interchange arrived even if we couldn't apply it.
-    const ack997Id = await emit997(db, orgId, partner.id, interchange).catch(() => null);
+    const ack997Id = hasContentSets ? await emit997(db, orgId, partner.id, interchange).catch(() => null) : null;
     await db
       .from("edi_messages")
       .update({ status: "error", error: message, processed_at: new Date().toISOString() })
       .eq("id", messageId);
-    return { messageId, transactionSet, status: "error", error: message, orderIds, ack997Id };
+    return { messageId, transactionSet, status: "error", error: message, orderIds, ack997Id, acknowledged };
   }
 
-  const ack997Id = await emit997(db, orgId, partner.id, interchange);
+  const ack997Id = hasContentSets ? await emit997(db, orgId, partner.id, interchange) : null;
   await db
     .from("edi_messages")
     .update({
@@ -172,7 +279,7 @@ export async function processInboundInterchange(db: Db, orgId: string, raw: stri
       related_order_id: orderIds[0] ?? null,
     })
     .eq("id", messageId);
-  return { messageId, transactionSet, status: "processed", error: null, orderIds, ack997Id };
+  return { messageId, transactionSet, status: "processed", error: null, orderIds, ack997Id, acknowledged };
 }
 
 export interface ResolvedLine {

@@ -52,6 +52,10 @@ All data is org-scoped by the key's `org_id`.
 | `POST /admin/poll/:endpointId` | service-role key | manual file-endpoint poll |
 | `POST /admin/preview/parse` | service-role key | dry-run classify/parse/resolve, no writes |
 | `POST /admin/preview/fetch/:endpointId` | service-role key | fetch sample files, nothing marked processed |
+| `GET /admin/retry/:endpointId` | service-role key | retry queue + dead-letter state |
+| `POST /admin/requeue/:endpointId` | service-role key | `{key}` — clear failure state for a file |
+| `POST /admin/edi/retry/:messageId` | service-role key | reprocess a stored inbound message in place |
+| `GET /admin/edi/unacknowledged` | service-role key | outbound EDI still awaiting a partner 997 |
 
 ## EDI X12
 
@@ -73,6 +77,22 @@ Content starting with `ISA` goes to EDI intake; otherwise CSV routed by
 sniffs headers). Outcomes land in `integration_runs` and the endpoint's
 `last_polled_at`/`last_error`. Credentials live only in the config jsonb and
 env — they are never logged.
+
+**Retry queue**: a file that fails ingestion is retried on later polls with
+exponential backoff, then dead-lettered after `max_retries` (per-endpoint
+`config.retry = {max_retries, base_backoff_minutes, max_backoff_minutes}`;
+defaults 5 / 15m / 24h). State lives in `config.retry_state` /
+`config.dead_letter`; inspect with `GET /admin/retry/:endpointId`, clear with
+`POST /admin/requeue/:endpointId {key}`. Failed inbound EDI messages can be
+reprocessed in place (same ledger row) after a mapping or partner fix via
+`POST /admin/edi/retry/:messageId`.
+
+**997 reconciliation**: inbound 997s are matched to outbound messages by
+per-org control number — accepted flips the outbound row to `processed`
+(stamping `processed_at`), rejected flips it to `error`. Outbound 855/856/810
+still awaiting acknowledgment are listed by
+`GET /admin/edi/unacknowledged?org_id=&older_than_minutes=`. The gateway
+never answers a 997 with another 997.
 
 ## Mapping profiles (data-driven, for a management UI)
 

@@ -144,6 +144,7 @@ export function buildServer(config: Config, db: Db): FastifyInstance {
         transaction_set: result.transactionSet,
         order_ids: result.orderIds,
         ack_997_id: result.ack997Id,
+        acknowledged: result.acknowledged,
       };
     },
   );
