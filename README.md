@@ -94,6 +94,22 @@ still awaiting acknowledgment are listed by
 `GET /admin/edi/unacknowledged?org_id=&older_than_minutes=`. The gateway
 never answers a 997 with another 997.
 
+## Admin dashboard
+
+A built-in operator console at **`/ui`** covers every function and setting:
+Overview (health cards, recent runs), API Clients (create with one-time key
+reveal, scopes, rate limits, activate/deactivate), EDI Partners (ISA identity,
+buyer-org link, per-partner mapping editor), EDI Messages (filterable in/out
+ledger, raw X12 viewer, in-place reprocess, awaiting-997 report), File
+Endpoints (SFTP/HTTPS connection, mapping + retry policy JSON, poll now,
+retry/dead-letter queue with requeue), Preview/Dry-run (trial mappings with
+zero writes, sample fetch), Org Settings (stock status rules, exposed dynamic
+objects, EDI mappings), and Logs & Runs.
+
+Sign in with `GATEWAY_ADMIN_TOKEN` (set it in env so the service-role key
+never has to be typed into a browser; without it the service-role key is the
+fallback). Endpoint credentials are masked in the UI and preserved on save.
+
 ## Mapping profiles (data-driven, for a management UI)
 
 Supplier-specific data mapping is configuration, not code, so a hub UI can

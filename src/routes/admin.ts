@@ -35,14 +35,20 @@ interface PreviewParseBody {
  * sample without writing anything, and fetch sample files from an endpoint
  * without marking them processed.
  */
-export function registerAdminRoutes(app: FastifyInstance, config: Config, db: Db) {
-  const requireServiceRole: preHandlerHookHandler = async (req, reply) => {
+/** Guard for the admin surface: service-role key or the dedicated admin token. */
+export function makeAdminGuard(config: Config): preHandlerHookHandler {
+  return async (req, reply) => {
     const header = req.headers.authorization ?? "";
     const token = header.replace(/^Bearer\s+/i, "").trim();
-    if (!token || token !== config.serviceRoleKey) {
-      return reply.code(401).send({ ok: false, status: 401, error: "service role key required" });
+    const allowed = token && (token === config.serviceRoleKey || (config.adminToken && token === config.adminToken));
+    if (!allowed) {
+      return reply.code(401).send({ ok: false, status: 401, error: "admin token required" });
     }
   };
+}
+
+export function registerAdminRoutes(app: FastifyInstance, config: Config, db: Db) {
+  const requireServiceRole = makeAdminGuard(config);
 
   app.post<{ Params: { endpointId: string } }>(
     "/admin/poll/:endpointId",

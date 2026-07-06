@@ -72,6 +72,7 @@ describe("gateway auth + routes", () => {
       port: 0,
       host: "127.0.0.1",
       pollCron: "",
+      adminToken: null,
     };
     app = buildServer(config, fakeDb(log));
     await app.ready();

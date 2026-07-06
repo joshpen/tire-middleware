@@ -1,4 +1,8 @@
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import Fastify, { type FastifyInstance } from "fastify";
+import fastifyStatic from "@fastify/static";
+import { registerAdminApi } from "./routes/adminApi.js";
 import { registerApiKeyAuth } from "./auth/apiKey.js";
 import type { Config } from "./config.js";
 import type { Db } from "./db.js";
@@ -228,6 +232,14 @@ export function buildServer(config: Config, db: Db): FastifyInstance {
   );
 
   registerAdminRoutes(app, config, db);
+  registerAdminApi(app, config, db);
+
+  // Admin dashboard (static SPA) at /ui.
+  app.register(fastifyStatic, {
+    root: join(dirname(fileURLToPath(import.meta.url)), "..", "public", "ui"),
+    prefix: "/ui/",
+  });
+  app.get("/ui", (_req, reply) => reply.redirect("/ui/"));
 
   return app;
 }
