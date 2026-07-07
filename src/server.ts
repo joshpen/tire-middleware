@@ -13,6 +13,7 @@ import { processInboundInterchange } from "./edi/service.js";
 import { getExposedObjects } from "./mappings.js";
 import { registerMcp } from "./mcp.js";
 import { registerAdminRoutes } from "./routes/admin.js";
+import { registerPortalRoutes } from "./routes/portal.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -255,11 +256,20 @@ export function buildServer(config: Config, db: Db): FastifyInstance {
   registerAdminRoutes(app, config, db);
   registerAdminApi(app, config, db);
   registerMcp(app, db);
+  registerPortalRoutes(app, db);
 
+  const publicDir = join(dirname(fileURLToPath(import.meta.url)), "..", "public");
   // Admin dashboard (static SPA) at /ui.
   app.register(fastifyStatic, {
-    root: join(dirname(fileURLToPath(import.meta.url)), "..", "public", "ui"),
+    root: join(publicDir, "ui"),
     prefix: "/ui/",
+  });
+  // Embeddable portal widgets, servable cross-origin.
+  app.register(fastifyStatic, {
+    root: join(publicDir, "embed"),
+    prefix: "/embed/",
+    decorateReply: false,
+    setHeaders: (res) => res.setHeader("Access-Control-Allow-Origin", "*"),
   });
   app.get("/ui", (_req, reply) => reply.redirect("/ui/"));
 

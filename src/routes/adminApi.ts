@@ -3,6 +3,7 @@ import type { FastifyInstance } from "fastify";
 import type { Config } from "../config.js";
 import type { Db } from "../db.js";
 import { getHubConnection, mw, syncCatalog, testConnection } from "../hub/connector.js";
+import { generatePortalKey } from "../portal/service.js";
 import { processOutbox, requeueDelivery } from "../hub/outbox.js";
 import { makeAdminGuard } from "./admin.js";
 
@@ -403,6 +404,121 @@ export function registerAdminApi(app: FastifyInstance, config: Config, db: Db) {
     const outcomes = await processOutbox(db);
     return { ok: true, outcomes };
   });
+
+  // ── Headless portal management ──────────────────────────────────────────────
+
+  app.get<{ Params: { orgId: string } }>("/admin/api/portal-settings/:orgId", opts, async (req) => {
+    const { data } = await mw(db, "dealer_portal_settings").select("*").eq("dealer_id", req.params.orgId).maybeSingle();
+    return { ok: true, settings: data ?? null };
+  });
+
+  app.put<{ Params: { orgId: string }; Body: Record<string, unknown> }>(
+    "/admin/api/portal-settings/:orgId",
+    opts,
+    async (req, reply) => {
+      const allowed = [
+        "slug", "portal_enabled", "headless_enabled", "quote_enabled", "booking_enabled", "warranty_enabled",
+        "fleet_enabled", "services_enabled", "promotions_enabled", "catalog_enabled", "allowed_origins",
+        "iframe_allowed_origins", "custom_domain", "profile",
+      ];
+      const patch = Object.fromEntries(Object.entries(req.body ?? {}).filter(([k]) => allowed.includes(k)));
+      if (typeof patch.slug === "string") patch.slug = patch.slug.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-");
+      if (!patch.slug) return reply.code(400).send({ ok: false, error: "slug is required" });
+      const { data, error } = await mw(db, "dealer_portal_settings")
+        .upsert({ dealer_id: req.params.orgId, ...patch, updated_at: new Date().toISOString() }, { onConflict: "dealer_id" })
+        .select("id, slug")
+        .single();
+      if (error) throw new Error(error.message);
+      return { ok: true, ...data };
+    },
+  );
+
+  app.get<{ Querystring: { dealer_id?: string } }>("/admin/api/portal-keys", opts, async (req) => {
+    let query = mw(db, "portal_api_keys")
+      .select("id, dealer_id, token_prefix, label, allowed_origins, allowed_modules, rate_limit, status, last_used_at, created_at")
+      .order("created_at", { ascending: false })
+      .limit(200);
+    if (req.query.dealer_id) query = query.eq("dealer_id", req.query.dealer_id);
+    const { data, error } = await query;
+    if (error) throw new Error(error.message);
+    return { ok: true, keys: data ?? [] };
+  });
+
+  app.post<{ Body: { dealer_id?: string; label?: string; allowed_modules?: string[]; allowed_origins?: string[]; per_minute?: number } }>(
+    "/admin/api/portal-keys",
+    opts,
+    async (req, reply) => {
+      const { dealer_id, label, allowed_modules, allowed_origins, per_minute } = req.body ?? {};
+      if (!dealer_id || !label) return reply.code(400).send({ ok: false, error: "dealer_id and label required" });
+      const key = generatePortalKey();
+      const { data, error } = await mw(db, "portal_api_keys")
+        .insert({
+          dealer_id,
+          token_prefix: key.prefix,
+          hashed_token: key.hash,
+          label,
+          allowed_modules: allowed_modules ?? ["quote", "booking", "warranty", "fleet", "services", "promotions", "catalog", "events"],
+          allowed_origins: allowed_origins ?? [],
+          rate_limit: { per_minute: per_minute ?? 120 },
+          created_by: "admin",
+        })
+        .select("id")
+        .single();
+      if (error) throw new Error(error.message);
+      // Raw key shown once; only the hash is stored.
+      return { ok: true, id: data.id, portal_key: key.raw };
+    },
+  );
+
+  app.patch<{ Params: { id: string }; Body: { status?: string; label?: string; allowed_modules?: string[]; allowed_origins?: string[] } }>(
+    "/admin/api/portal-keys/:id",
+    opts,
+    async (req, reply) => {
+      const allowed = ["status", "label", "allowed_modules", "allowed_origins"];
+      const patch = Object.fromEntries(Object.entries(req.body ?? {}).filter(([k]) => allowed.includes(k)));
+      if (patch.status && !["active", "disabled", "revoked"].includes(String(patch.status))) {
+        return reply.code(400).send({ ok: false, error: "status must be active|disabled|revoked" });
+      }
+      const { error } = await mw(db, "portal_api_keys")
+        .update({ ...patch, updated_at: new Date().toISOString() })
+        .eq("id", req.params.id);
+      if (error) throw new Error(error.message);
+      return { ok: true };
+    },
+  );
+
+  app.get<{ Querystring: { dealer_id?: string; type?: string; status?: string; limit?: string } }>(
+    "/admin/api/portal-requests",
+    opts,
+    async (req) => {
+      let query = mw(db, "portal_requests")
+        .select("id, dealer_id, type, status, source, customer_name, customer_email, customer_phone, payload, origin, created_at")
+        .order("created_at", { ascending: false })
+        .limit(Math.min(Number(req.query.limit) || 100, 500));
+      if (req.query.dealer_id) query = query.eq("dealer_id", req.query.dealer_id);
+      if (req.query.type) query = query.eq("type", req.query.type);
+      if (req.query.status) query = query.eq("status", req.query.status);
+      const { data, error } = await query;
+      if (error) throw new Error(error.message);
+      return { ok: true, requests: data ?? [] };
+    },
+  );
+
+  app.patch<{ Params: { id: string }; Body: { status?: string } }>(
+    "/admin/api/portal-requests/:id",
+    opts,
+    async (req, reply) => {
+      const status = req.body?.status;
+      if (!status || !["new", "reviewed", "converted", "closed", "spam"].includes(status)) {
+        return reply.code(400).send({ ok: false, error: "status must be new|reviewed|converted|closed|spam" });
+      }
+      const { error } = await mw(db, "portal_requests")
+        .update({ status, updated_at: new Date().toISOString() })
+        .eq("id", req.params.id);
+      if (error) throw new Error(error.message);
+      return { ok: true };
+    },
+  );
 
   // ── Request logs + integration runs ─────────────────────────────────────────
 

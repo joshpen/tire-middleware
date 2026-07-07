@@ -137,6 +137,7 @@ const VIEWS = {
   messages: { label: "EDI Messages", render: viewMessages },
   endpoints: { label: "File Endpoints", render: viewEndpoints },
   hub: { label: "Hub Connection", render: viewHub },
+  portal: { label: "Customer Portal", render: viewPortal },
   preview: { label: "Preview / Dry-run", render: viewPreview },
   settings: { label: "Org Settings", render: viewSettings },
   logs: { label: "Logs & Runs", render: viewLogs },
@@ -617,6 +618,161 @@ function editHubConnection(c) {
           }});
         }
         close(); toast("Connection saved"); route();
+      }, ""))));
+}
+
+// ── Customer portal (headless & embeds) ───────────────────────────────────────
+
+const PORTAL_MODULES = ["quote", "booking", "warranty", "fleet", "services", "promotions", "catalog"];
+
+async function viewPortal() {
+  const org = orgSelect();
+  const body = h("div", {});
+
+  async function load() {
+    const dealerId = org.value;
+    const { settings } = await api(`/admin/api/portal-settings/${dealerId}`);
+    const { keys } = await api(`/admin/api/portal-keys?dealer_id=${dealerId}`);
+    const { requests } = await api(`/admin/api/portal-requests?dealer_id=${dealerId}&limit=25`);
+
+    // Settings form
+    const slug = h("input", { value: settings?.slug || "", placeholder: "dealer-slug" });
+    const origins = h("textarea", { class: "code", rows: 3, style: "width:100%", placeholder: "https://dealerwebsite.com\nhttps://dealer-app.lovable.app" },
+      (settings?.allowed_origins || []).join("\n"));
+    const profile = jsonArea(settings?.profile ?? {
+      display_name: "", logo_url: "", brand: { primary_color: "#1f2937", accent_color: "#2563eb" },
+      contact: { phone: "", email: "" }, services: [], locations: [], promotions: [], catalog_categories: [],
+    }, 10);
+    const moduleChecks = h("div", { class: "checks" }, PORTAL_MODULES.map((m) =>
+      h("label", {}, h("input", { type: "checkbox", value: m, ...((settings ? settings[`${m}_enabled`] : ["quote", "booking", "services", "promotions", "catalog"].includes(m)) ? { checked: "" } : {}) }), m)));
+    const enabledToggle = h("label", { style: "display:flex;align-items:center;gap:8px;margin-top:12px" },
+      h("input", { type: "checkbox", ...((settings?.headless_enabled ?? true) ? { checked: "" } : {}) }), "Headless portal enabled");
+
+    const settingsBlock = h("div", {},
+      h("h2", {}, "Portal settings"),
+      h("div", { class: "row" }, field("Dealer slug (public URL identity)", slug), field("", enabledToggle)),
+      field("Enabled modules", moduleChecks),
+      field("Allowed origins (one per line)", origins, "Requests from other origins are rejected (localhost always allowed for development)."),
+      field("Portal-safe public profile (JSON)", profile, "display_name, logo_url, brand colors, contact, services[], locations[], promotions[], catalog_categories[] — public content only."),
+      h("div", { class: "toolbar", style: "margin-top:10px" },
+        actionBtn("Save settings", async () => {
+          const bodyReq = {
+            slug: slug.value.trim(),
+            headless_enabled: enabledToggle.querySelector("input").checked,
+            portal_enabled: true,
+            allowed_origins: origins.value.split("\n").map((s) => s.trim()).filter(Boolean),
+            profile: readJson(profile, "profile") ?? {},
+          };
+          for (const m of PORTAL_MODULES) {
+            bodyReq[`${m}_enabled`] = [...moduleChecks.querySelectorAll("input:checked")].some((i) => i.value === m);
+          }
+          await api(`/admin/api/portal-settings/${dealerId}`, { method: "PUT", body: bodyReq });
+          toast("Portal settings saved"); load();
+        }, "")));
+
+    // Keys
+    const keyRows = keys.map((k) => h("tr", {},
+      h("td", {}, k.label, h("div", { class: "muted" }, k.token_prefix)),
+      h("td", {}, (k.allowed_modules || []).map((m) => badge(m))),
+      h("td", {}, h("span", { class: `badge ${k.status === "active" ? "ok" : "err"}` }, k.status)),
+      h("td", {}, fmtDate(k.last_used_at)),
+      h("td", {},
+        k.status === "active" ? actionBtn("Disable", async () => {
+          await api(`/admin/api/portal-keys/${k.id}`, { method: "PATCH", body: { status: "disabled" } });
+          toast("Key disabled"); load();
+        }, "danger small") : actionBtn("Re-enable", async () => {
+          await api(`/admin/api/portal-keys/${k.id}`, { method: "PATCH", body: { status: "active" } });
+          toast("Key re-enabled"); load();
+        }), " ",
+        actionBtn("Revoke", async () => {
+          await api(`/admin/api/portal-keys/${k.id}`, { method: "PATCH", body: { status: "revoked" } });
+          toast("Key revoked"); load();
+        }, "danger small"))));
+
+    const keysBlock = h("div", {},
+      h("h2", {}, "Public portal keys"),
+      h("p", { class: "sub" }, "Browser-safe restricted keys (pk_portal_dealer_…). Raw keys are shown once at creation."),
+      h("div", { class: "toolbar" }, h("div", { class: "spacer" }),
+        h("button", { onclick: () => createPortalKey(dealerId, settings, load) }, "+ New portal key")),
+      table(["Label", "Modules", "Status", "Last used", ""], keyRows, "No portal keys yet."));
+
+    // Embed + Lovable prompt generator
+    const keyInput = h("input", { placeholder: "paste a raw portal key (pk_portal_dealer_…)" });
+    const widgetSel = h("select", {}, ["quote", "booking", "warranty", "fleet"].map((w) => h("option", { value: w }, w)));
+    const genOut = h("pre", { class: "code", style: "display:none" });
+    const embedBlock = h("div", {},
+      h("h2", {}, "Embed & integrate"),
+      h("p", { class: "sub" }, `Portal API base: ${location.origin}/api/portal/v1 · Widgets: ${location.origin}/embed/<widget>.js`),
+      h("div", { class: "row" }, field("Portal key", keyInput), field("Widget", widgetSel)),
+      h("div", { class: "toolbar", style: "margin-top:8px" },
+        actionBtn("Copy embed code", async () => {
+          if (!settings?.slug) throw new Error("save portal settings (slug) first");
+          if (!keyInput.value.trim()) throw new Error("paste a portal key first");
+          const code = `<div\n  data-tread-ready-widget="${widgetSel.value}"\n  data-dealer-slug="${settings.slug}"\n  data-portal-key="${keyInput.value.trim()}">\n</div>\n<script src="${location.origin}/embed/${widgetSel.value}.js"><\/script>`;
+          genOut.style.display = "block"; genOut.textContent = code;
+          await navigator.clipboard.writeText(code); toast("Embed code copied");
+        }, ""),
+        actionBtn("Copy Lovable prompt", async () => {
+          if (!settings?.slug) throw new Error("save portal settings (slug) first");
+          if (!keyInput.value.trim()) throw new Error("paste a portal key first");
+          const modules = PORTAL_MODULES.filter((m) => settings[`${m}_enabled`]);
+          const prompt = `Build a customer-facing tire dealer portal using Tread Ready's headless portal API and embed widgets.\n\nDealer slug: ${settings.slug}\nPortal API base URL: ${location.origin}/api/portal/v1\nEnabled modules: ${modules.join(", ")}\nPublic portal key: ${keyInput.value.trim()}\n\nUse Tread Ready widgets (script src ${location.origin}/embed/<widget>.js — quote, booking, warranty, fleet) or the portal API directly for dealer profile/brand, services, locations, promotions, catalog categories, and for submitting quote requests, appointments, warranty intake, and fleet inquiries. Send the portal key as the X-Portal-Key header.\n\nDo not build your own pricing, inventory, warranty approval, payment, tax, or customer account logic. Tread Ready is the system of record. Design around the dealer's services, brand colors, and locations. Mobile-first and simple.`;
+          genOut.style.display = "block"; genOut.textContent = prompt;
+          await navigator.clipboard.writeText(prompt); toast("Lovable prompt copied");
+        })),
+      genOut);
+
+    // Recent requests
+    const reqRows = requests.map((r) => h("tr", {},
+      h("td", {}, fmtDate(r.created_at)),
+      h("td", {}, badge(r.type)),
+      h("td", {}, r.customer_name || "—", h("div", { class: "muted" }, r.customer_email || r.customer_phone || "")),
+      h("td", {}, h("span", { class: `badge ${r.status === "new" ? "info" : ""}` }, r.status)),
+      h("td", { class: "muted" }, r.origin || r.source || ""),
+      h("td", {}, r.status === "new" ? actionBtn("Mark reviewed", async () => {
+        await api(`/admin/api/portal-requests/${r.id}`, { method: "PATCH", body: { status: "reviewed" } });
+        toast("Updated"); load();
+      }) : null)));
+    const requestsBlock = h("div", {},
+      h("h2", {}, "Recent portal requests"),
+      table(["When", "Type", "Customer", "Status", "Origin", ""], reqRows, "No portal requests yet."));
+
+    body.replaceChildren(settingsBlock, keysBlock, embedBlock, requestsBlock);
+  }
+
+  org.addEventListener("change", load);
+  await load();
+  return h("div", {},
+    h("h1", {}, "Customer Portal — Headless & Embeds"),
+    h("p", { class: "sub" }, "Power dealer websites and Lovable apps with portal-safe APIs, widgets, and restricted public keys."),
+    field("Dealer", org),
+    body);
+}
+
+function createPortalKey(dealerId, settings, reload) {
+  const label = h("input", { placeholder: "e.g. Dealer website" });
+  const modules = h("div", { class: "checks" }, [...PORTAL_MODULES, "events"].map((m) =>
+    h("label", {}, h("input", { type: "checkbox", value: m, checked: "" }), m)));
+  const rate = h("input", { type: "number", value: "120" });
+  const { close, box } = modal("New public portal key", h("div", {},
+    field("Label", label),
+    field("Allowed modules", modules),
+    field("Rate limit (req/min)", rate),
+    h("div", { class: "actions" },
+      h("button", { class: "secondary", onclick: () => close() }, "Cancel"),
+      actionBtn("Create", async () => {
+        const res = await api("/admin/api/portal-keys", { method: "POST", body: {
+          dealer_id: dealerId,
+          label: label.value.trim() || "portal key",
+          allowed_modules: [...modules.querySelectorAll("input:checked")].map((i) => i.value),
+          per_minute: Number(rate.value) || 120,
+        }});
+        box.replaceChildren(h("h3", {}, "Portal key created"),
+          h("p", { class: "sub" }, "Copy it now — only a hash is stored; it cannot be shown again."),
+          h("div", { class: "keybox" }, res.portal_key),
+          h("div", { class: "actions" },
+            h("button", { onclick: () => navigator.clipboard.writeText(res.portal_key).then(() => toast("Copied")) }, "Copy"),
+            h("button", { class: "secondary", onclick: () => { close(); reload(); } }, "Done")));
       }, ""))));
 }
 

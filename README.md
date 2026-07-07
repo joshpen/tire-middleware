@@ -150,6 +150,41 @@ Sign in with `GATEWAY_ADMIN_TOKEN` (set it in env so the service-role key
 never has to be typed into a browser; without it the service-role key is the
 fallback). Endpoint credentials are masked in the UI and preserved on save.
 
+## Headless dealer portal (Tread Ready portal layer)
+
+The gateway powers customer-facing dealer portals headlessly: dealers embed
+Tread Ready flows into their own websites or Lovable apps while the platform
+stays the system of record. Nothing internal (inventory, cost, margin,
+customers, POS, pricing/tax/warranty-approval logic) is reachable.
+
+- **Public API** `/api/portal/v1/dealers/:dealerSlug` — profile, `/brand`,
+  `/services`, `/locations`, `/promotions`, `/catalog-categories` (reads);
+  `/quote-requests`, `/appointments`, `/warranty-intake` (intake only — never
+  approval), `/fleet-inquiries`, `/events` (writes). Auth: `X-Portal-Key`
+  with a browser-safe restricted token (`pk_portal_dealer_…`, hashed at rest,
+  shown once). Every call validates tenant, dealer status, module enablement
+  (dealer AND key), Origin allowlist (localhost exempt for dev), rate limits
+  (per key + per IP), input schema, and sanitization; requests/events are
+  stored per dealer and forwarded to the hub via the outbox
+  (`portal.<type>.create`).
+- **Widgets** `/embed/{quote,booking,warranty,fleet}.js` — drop-in embeds
+  that load dealer brand, render a responsive form, and submit to the portal
+  API. `<div data-tread-ready-widget="quote" data-dealer-slug="…"
+  data-portal-key="pk_portal_dealer_…"></div>`
+- **SDK** `src/portal-sdk/client` (`createTreadReadyPortalClient`) and
+  `src/portal-sdk/react` (React-injected `TreadReadyQuoteForm`,
+  `TreadReadyBookingForm`, `TreadReadyWarrantyStart`, `TreadReadyFleetInquiry`,
+  `TreadReadyDealerServices`) — package-ready, dependency-free.
+- **MCP-safe portal tools** `src/portal/tools.ts` — schemas + wrappers
+  (profile, brand tokens, widgets, embed code, config validation, key
+  issuance) ready to register on an admin-scoped MCP surface.
+- **Admin** — dashboard page *Customer Portal* (settings/slug/modules/origins/
+  profile, key lifecycle with one-time reveal, embed code + Lovable prompt
+  generator, request review) and `/admin/api/portal-*` routes.
+- **Demo data** — `npx tsx scripts/seed-portal.ts` seeds Northwest Ag Tire
+  (quote/booking/warranty/fleet) and Metro Tire & Service (quote/booking),
+  origin `http://localhost:3000`.
+
 ## Mapping profiles (data-driven, for a management UI)
 
 Supplier-specific data mapping is configuration, not code, so a hub UI can
