@@ -4,7 +4,7 @@ import type { Config } from "../config.js";
 import type { Db } from "../db.js";
 import { getHubConnection, mw, syncCatalog, testConnection } from "../hub/connector.js";
 import { generatePortalKey } from "../portal/service.js";
-import { processOutbox, requeueDelivery } from "../hub/outbox.js";
+import { processOutbox, requeueDelivery, requeueUnsupported } from "../hub/outbox.js";
 import { makeAdminGuard } from "./admin.js";
 
 /**
@@ -327,17 +327,17 @@ export function registerAdminApi(app: FastifyInstance, config: Config, db: Db) {
     return { ok: true, connections: data ?? [] };
   });
 
-  app.post<{ Body: { org_id?: string; name?: string; hub_url?: string; anon_key?: string; api_key?: string } }>(
+  app.post<{ Body: { org_id?: string; name?: string; hub_url?: string; anon_key?: string; api_key?: string; storefront_key?: string } }>(
     "/admin/api/hub-connections",
     opts,
     async (req, reply) => {
-      const { org_id, name, hub_url, anon_key, api_key } = req.body ?? {};
+      const { org_id, name, hub_url, anon_key, api_key, storefront_key } = req.body ?? {};
       if (!org_id || !hub_url || !anon_key || !api_key) {
         return reply.code(400).send({ ok: false, error: "org_id, hub_url, anon_key, api_key required" });
       }
       const { data, error } = await mw(db, "hub_connections")
         .upsert(
-          { org_id, name: name || "tread-sync-hub", hub_url, anon_key, api_key, is_active: true, updated_at: new Date().toISOString() },
+          { org_id, name: name || "tread-sync-hub", hub_url, anon_key, api_key, storefront_key: storefront_key || null, is_active: true, updated_at: new Date().toISOString() },
           { onConflict: "org_id" },
         )
         .select("id")
@@ -351,7 +351,7 @@ export function registerAdminApi(app: FastifyInstance, config: Config, db: Db) {
     "/admin/api/hub-connections/:id",
     opts,
     async (req) => {
-      const allowed = ["name", "hub_url", "anon_key", "api_key", "is_active"];
+      const allowed = ["name", "hub_url", "anon_key", "api_key", "storefront_key", "is_active"];
       const patch = Object.fromEntries(
         Object.entries(req.body ?? {}).filter(([k, v]) => allowed.includes(k) && v !== "" && v !== "•••"),
       );
@@ -396,6 +396,12 @@ export function registerAdminApi(app: FastifyInstance, config: Config, db: Db) {
   app.post("/admin/hub/outbox/process", opts, async () => {
     const outcomes = await processOutbox(db);
     return { ok: true, outcomes };
+  });
+
+  // Bulk replay of deliveries that parked before the hub supported their resource.
+  app.post("/admin/hub/requeue-unsupported", opts, async () => {
+    const result = await requeueUnsupported(db);
+    return { ok: true, ...result };
   });
 
   app.post<{ Params: { id: string } }>("/admin/hub/deliveries/:id/retry", opts, async (req, reply) => {
@@ -492,7 +498,7 @@ export function registerAdminApi(app: FastifyInstance, config: Config, db: Db) {
     opts,
     async (req) => {
       let query = mw(db, "portal_requests")
-        .select("id, dealer_id, type, status, source, customer_name, customer_email, customer_phone, payload, origin, created_at")
+        .select("id, dealer_id, type, status, source, customer_name, customer_email, customer_phone, payload, origin, hub_record_id, hub_record_type, created_at")
         .order("created_at", { ascending: false })
         .limit(Math.min(Number(req.query.limit) || 100, 500));
       if (req.query.dealer_id) query = query.eq("dealer_id", req.query.dealer_id);

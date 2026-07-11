@@ -5,7 +5,8 @@ import { z } from "zod";
 import { sha256Hex } from "./auth/apiKey.js";
 import type { Db } from "./db.js";
 import * as resources from "./domain/resources.js";
-import type { Actor } from "./domain/resources.js";
+import { requireScope, type Actor } from "./domain/resources.js";
+import { callStorefront, dealerSlugFor, getStorefrontConnection } from "./hub/storefront.js";
 
 /**
  * MCP endpoint (Streamable HTTP, stateless) so an agent can connect and
@@ -149,6 +150,69 @@ function buildMcpServer(db: Db, actor: Actor): McpServer {
     "Update a warranty claim's status (submitted, under_review, approved, denied, closed) and/or resolution note.",
     { id_or_claim_number: z.string(), status: z.string().optional(), resolution: z.string().optional() },
     ({ id_or_claim_number, ...patch }) => run(() => resources.updateClaim(db, actor, id_or_claim_number, patch)),
+  );
+
+  // ── Consumer storefront (hub's publishable-key API) ─────────────────────────
+  // For agents building a dealer site (e.g. in Lovable): thin passthroughs to
+  // the hub's /api/storefront/v1 surface. No local staging — the storefront
+  // API is consumer-grade and idempotent enough on its own. The publishable
+  // key comes from hub_connections.storefront_key, never from the agent.
+
+  const storefront = async (
+    scope: string,
+    dealerSlug: string | undefined,
+    method: "GET" | "POST",
+    endpoint: string,
+    options: { query?: Record<string, string>; body?: unknown } = {},
+  ) => {
+    requireScope(actor, scope);
+    const conn = await getStorefrontConnection(db, actor.orgId);
+    const slug = dealerSlug ?? (await dealerSlugFor(db, actor.orgId));
+    return callStorefront(conn, slug, method, endpoint, options);
+  };
+
+  const slugArg = { dealer_slug: z.string().optional().describe("Dealer slug; defaults to this org's portal slug.") };
+
+  server.tool(
+    "storefront_get_site",
+    "The dealer's consumer storefront site config (branding, pages, services) from the hub's storefront API.",
+    slugArg,
+    ({ dealer_slug }) => run(() => storefront("storefront:read", dealer_slug, "GET", "site")),
+  );
+
+  server.tool(
+    "storefront_list_inventory",
+    "Consumer-facing storefront inventory for the dealer, with optional query filters (e.g. size, category, page).",
+    { ...slugArg, query: z.record(z.string(), z.string()).optional() },
+    ({ dealer_slug, query }) => run(() => storefront("storefront:read", dealer_slug, "GET", "inventory", { query })),
+  );
+
+  server.tool(
+    "storefront_list_slots",
+    "Available appointment slots on the dealer's storefront, with optional query filters (e.g. date range, service).",
+    { ...slugArg, query: z.record(z.string(), z.string()).optional() },
+    ({ dealer_slug, query }) => run(() => storefront("storefront:read", dealer_slug, "GET", "slots", { query })),
+  );
+
+  server.tool(
+    "storefront_create_booking",
+    "Book an appointment slot on the dealer's storefront. Payload per the hub's storefront OpenAPI spec.",
+    { ...slugArg, payload: z.record(z.string(), z.unknown()) },
+    ({ dealer_slug, payload }) => run(() => storefront("storefront:write", dealer_slug, "POST", "bookings", { body: payload })),
+  );
+
+  server.tool(
+    "storefront_create_order",
+    "Place a consumer order on the dealer's storefront. Payload per the hub's storefront OpenAPI spec.",
+    { ...slugArg, payload: z.record(z.string(), z.unknown()) },
+    ({ dealer_slug, payload }) => run(() => storefront("storefront:write", dealer_slug, "POST", "orders", { body: payload })),
+  );
+
+  server.tool(
+    "storefront_create_quote",
+    "Request a quote on the dealer's storefront. Payload per the hub's storefront OpenAPI spec.",
+    { ...slugArg, payload: z.record(z.string(), z.unknown()) },
+    ({ dealer_slug, payload }) => run(() => storefront("storefront:write", dealer_slug, "POST", "quotes", { body: payload })),
   );
 
   return server;

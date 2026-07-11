@@ -19,8 +19,19 @@ partners ──[REST / EDI X12 / SFTP / HTTPS]──▶ tread-sync-gateway ─�
   product-catalog cache (synced from the hub) for SKU resolution.
 - **The hub is reached only through its `api_gateway` RPC** with a hub-issued
   API key the hub can scope, rate-limit, revoke, and audit. Resources
-  available today: `products.list`, `orders.list`, `orders.ack`,
-  `inventory.push`, `edi.receive`. The hub repo is never modified from here.
+  available today (verified 2026-07-10): `products.list`, `products.upsert`,
+  `orders.list`, `orders.ack`, `orders.create`, `orders.update_status`,
+  `shipments.get`, `invoices.get`, `changes.since`, `inventory.push`,
+  `edi.receive`, `warranty.claim.create`, `warranty.claim.update` (status
+  `under_review`/`closed` only — adjudication is hub-internal),
+  `portal.request.create` (+ per-type aliases), and the dealer-safe content
+  reads `content.profile`, `content.branding`, `content.locations`,
+  `content.promotions`, `content.categories`. The hub repo is never modified
+  from here.
+- **Boundary:** consumer dealer-site embeds use the hub's **storefront API**
+  (publishable keys, `{hub_url}/api/storefront/v1`, OpenAPI at
+  `…/openapi.yaml`); machine/agent/partner integrations use this **gateway**
+  (secret keys, scopes, outbox, EDI).
 - **Dual mode:** orgs with an active `hub_connections` row proxy domain
   reads/writes to the hub API; orgs without one run against local tables
   (standalone/staging mode).
@@ -86,9 +97,19 @@ Tools: `list_products`, `get_product`, `upsert_product`, `list_orders`,
 `push_inventory`, `list_warranty_claims`, `get_warranty_claim`,
 `create_warranty_claim`, `update_warranty_claim`. REST routes and MCP tools
 are thin wrappers over the same resource layer (`src/domain/resources.ts`),
-so behavior is identical — including hub proxying and outbox staging for
-resources the hub's API doesn't accept yet (`orders.create`,
-`products.upsert`, `warranty.claim.*` park as `unsupported` for replay).
+so behavior is identical — including hub proxying and outbox staging with
+retry (a resource the hub doesn't recognize parks as `unsupported` for
+replay via `POST /admin/hub/requeue-unsupported`).
+
+**Storefront tools** (hub's consumer storefront API, publishable keys):
+`storefront_get_site`, `storefront_list_inventory`, `storefront_list_slots`,
+`storefront_create_booking`, `storefront_create_order`,
+`storefront_create_quote` — thin passthroughs to
+`{hub_url}/api/storefront/v1` for agents building dealer sites (e.g. in
+Lovable). They require the `storefront:read` / `storefront:write` scopes and
+a publishable storefront key stored on `hub_connections.storefront_key`
+(set in the admin UI) so agents never handle the key. The dealer slug
+defaults to the org's portal slug.
 | `POST /admin/poll/:endpointId` | service-role key | manual file-endpoint poll |
 | `POST /admin/preview/parse` | service-role key | dry-run classify/parse/resolve, no writes |
 | `POST /admin/preview/fetch/:endpointId` | service-role key | fetch sample files, nothing marked processed |
@@ -96,6 +117,7 @@ resources the hub's API doesn't accept yet (`orders.create`,
 | `POST /admin/requeue/:endpointId` | service-role key | `{key}` — clear failure state for a file |
 | `POST /admin/edi/retry/:messageId` | service-role key | reprocess a stored inbound message in place |
 | `GET /admin/edi/unacknowledged` | service-role key | outbound EDI still awaiting a partner 997 |
+| `POST /admin/hub/requeue-unsupported` | service-role key | bulk-requeue `unsupported` deliveries whose resource the hub now accepts |
 
 ## EDI X12
 
@@ -166,7 +188,12 @@ customers, POS, pricing/tax/warranty-approval logic) is reachable.
   (dealer AND key), Origin allowlist (localhost exempt for dev), rate limits
   (per key + per IP), input schema, and sanitization; requests/events are
   stored per dealer and forwarded to the hub via the outbox
-  (`portal.<type>.create`).
+  (`portal.<type>.create`, idempotent on the request's uuid). When the hub
+  converts the intake it answers with `created_record_id`/`record_type`,
+  stamped back on the local row (`hub_record_id`/`hub_record_type`) for
+  traceability. Hub-connected dealers serve content reads live from the
+  hub's `content.*` resources (~60s in-memory cache), falling back to the
+  locally curated profile when the hub is unreachable.
 - **Widgets** `/embed/{quote,booking,warranty,fleet}.js` — drop-in embeds
   that load dealer brand, render a responsive form, and submit to the portal
   API. `<div data-tread-ready-widget="quote" data-dealer-slug="…"

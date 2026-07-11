@@ -6,9 +6,18 @@ import type { Db } from "../db.js";
  * hub can scope, rate-limit, revoke, and audit. No shared database, no
  * service-role access — the hub controls exactly what this layer can do.
  *
- * Hub resources available today: products.list, orders.list, orders.ack,
- * inventory.push, edi.receive. Anything else is "unsupported" until the hub
- * grows the endpoint (the hub repo is not modified from here).
+ * Hub resources available today (verified against the hub 2026-07-10):
+ *   products.list, products.upsert
+ *   orders.list, orders.ack, orders.create, orders.update_status
+ *   shipments.get, invoices.get, changes.since
+ *   inventory.push, edi.receive
+ *   warranty.claim.create, warranty.claim.update (status under_review/closed
+ *     only — adjudication is hub-internal)
+ *   portal.request.create + aliases portal.{quote,appointment,warranty,fleet}.create
+ *   content.profile, content.branding, content.locations, content.promotions,
+ *     content.categories
+ * Anything else is "unsupported" until the hub grows the endpoint (the hub
+ * repo is not modified from here).
  */
 
 export interface HubConnection {
@@ -30,7 +39,31 @@ export interface HubResult {
   error?: string;
 }
 
-export const HUB_RESOURCES = ["products.list", "orders.list", "orders.ack", "inventory.push", "edi.receive"] as const;
+export const HUB_RESOURCES = [
+  "products.list",
+  "products.upsert",
+  "orders.list",
+  "orders.ack",
+  "orders.create",
+  "orders.update_status",
+  "shipments.get",
+  "invoices.get",
+  "changes.since",
+  "inventory.push",
+  "edi.receive",
+  "warranty.claim.create",
+  "warranty.claim.update",
+  "portal.request.create",
+  "portal.quote.create",
+  "portal.appointment.create",
+  "portal.warranty.create",
+  "portal.fleet.create",
+  "content.profile",
+  "content.branding",
+  "content.locations",
+  "content.promotions",
+  "content.categories",
+] as const;
 
 /** Untyped access to middleware-owned tables (not in the vendored hub types). */
 export const mw = (db: Db, table: string) => (db.from as (t: string) => any)(table);

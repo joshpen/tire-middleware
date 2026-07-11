@@ -1,6 +1,6 @@
 import type { Db } from "../db.js";
 import { backoffMinutes, DEFAULT_RETRY_POLICY } from "../files/retry.js";
-import { callHub, getHubConnection, mw, touchConnection, type HubConnection } from "./connector.js";
+import { callHub, getHubConnection, HUB_RESOURCES, mw, touchConnection, type HubConnection } from "./connector.js";
 
 /**
  * Delivery outbox: domain payloads bound for the hub, with bounded retry.
@@ -42,6 +42,25 @@ export async function enqueueDelivery(
 }
 
 const UNSUPPORTED_RE = /unknown resource/i;
+const PORTAL_CREATE_RE = /^portal\.(request|quote|appointment|warranty|fleet)\.create$/;
+
+/**
+ * Traceability: when a portal intake lands on the hub, stamp the hub's
+ * conversion result (lead / work order / claim intake id) on the local
+ * portal_requests row so operators can follow a request to the hub record.
+ */
+async function recordPortalConversion(db: Db, delivery: Delivery, data: unknown): Promise<void> {
+  const requestId = (delivery.payload as { portal_request_id?: string } | null)?.portal_request_id;
+  const result = (data ?? {}) as { created_record_id?: string; record_type?: string };
+  if (!requestId || !result.created_record_id) return;
+  await mw(db, "portal_requests")
+    .update({
+      hub_record_id: result.created_record_id,
+      hub_record_type: result.record_type ?? null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", requestId);
+}
 
 async function attemptOne(db: Db, delivery: Delivery, conn: HubConnection): Promise<string> {
   const attempts = delivery.attempts + 1;
@@ -53,6 +72,9 @@ async function attemptOne(db: Db, delivery: Delivery, conn: HubConnection): Prom
     if (result.ok) {
       await finish({ status: "delivered", delivered_at: new Date().toISOString(), response: result, last_error: null });
       await touchConnection(db, conn, null);
+      if (PORTAL_CREATE_RE.test(delivery.resource)) {
+        await recordPortalConversion(db, delivery, result.data).catch(() => {});
+      }
       return "delivered";
     }
     if (result.error && UNSUPPORTED_RE.test(result.error)) {
@@ -118,4 +140,20 @@ export async function requeueDelivery(db: Db, deliveryId: string): Promise<boole
     .select("id");
   if (error) throw new Error(`requeue failed: ${error.message}`);
   return (data ?? []).length > 0;
+}
+
+/**
+ * Bulk replay: deliveries that parked as 'unsupported' while the hub lacked
+ * the endpoint go back to 'pending' once the resource is in the hub's
+ * supported set (e.g. orders.create, products.upsert, warranty.claim.create).
+ */
+export async function requeueUnsupported(db: Db): Promise<{ requeued: number; resources: string[] }> {
+  const { data, error } = await mw(db, "hub_deliveries")
+    .update({ status: "pending", next_at: new Date().toISOString(), attempts: 0, last_error: null })
+    .eq("status", "unsupported")
+    .in("resource", [...HUB_RESOURCES])
+    .select("resource");
+  if (error) throw new Error(`bulk requeue failed: ${error.message}`);
+  const rows = (data ?? []) as { resource: string }[];
+  return { requeued: rows.length, resources: [...new Set(rows.map((r) => r.resource))] };
 }

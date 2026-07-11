@@ -566,7 +566,12 @@ async function viewHub() {
         actionBtn("Process outbox now", async () => {
           const r = await api("/admin/hub/outbox/process", { method: "POST" });
           toast(`Outbox: ${JSON.stringify(r.outcomes)}`); loadDeliveries();
-        }, "")),
+        }, ""), " ",
+        actionBtn("Requeue now-supported", async () => {
+          const r = await api("/admin/hub/requeue-unsupported", { method: "POST" });
+          toast(r.requeued ? `Requeued ${r.requeued} delivery(ies): ${r.resources.join(", ")}` : "Nothing to requeue");
+          loadDeliveries();
+        }, "secondary")),
       table(["When", "Org", "Resource", "Status", "Attempts", "Last error", ""],
         deliveries.map((d) => h("tr", {},
           h("td", {}, fmtDate(d.created_at)),
@@ -599,22 +604,25 @@ function editHubConnection(c) {
   const url = h("input", { value: c?.hub_url || "", placeholder: "https://<hub-project>.supabase.co" });
   const anonKey = h("input", { type: "password", placeholder: c ? "unchanged" : "hub anon key" });
   const apiKey = h("input", { type: "password", placeholder: c ? "unchanged" : "hub-issued API key (trk_live_…)" });
+  const storefrontKey = h("input", { type: "password", placeholder: c ? "unchanged" : "publishable storefront key (optional)" });
   const { close } = modal(c ? "Edit hub connection" : "New hub connection", h("div", {},
     h("div", { class: "row" }, field("Organization", org), field("Name", name)),
     field("Hub URL", url),
     field("Hub anon key", anonKey, "PostgREST apikey header — public key of the hub project."),
     field("Hub API key", apiKey, "Issued by the hub (api_clients): scoped, rate-limited, revocable."),
+    field("Storefront key", storefrontKey, "Publishable key for the hub's consumer storefront API — used by the MCP storefront tools."),
     h("div", { class: "actions" },
       h("button", { class: "secondary", onclick: () => close() }, "Cancel"),
       actionBtn("Save", async () => {
         if (c) {
           await api(`/admin/api/hub-connections/${c.id}`, { method: "PATCH", body: {
             name: name.value.trim(), hub_url: url.value.trim(), anon_key: anonKey.value, api_key: apiKey.value,
+            storefront_key: storefrontKey.value,
           }});
         } else {
           await api("/admin/api/hub-connections", { method: "POST", body: {
             org_id: org.value, name: name.value.trim(), hub_url: url.value.trim(),
-            anon_key: anonKey.value, api_key: apiKey.value,
+            anon_key: anonKey.value, api_key: apiKey.value, storefront_key: storefrontKey.value,
           }});
         }
         close(); toast("Connection saved"); route();

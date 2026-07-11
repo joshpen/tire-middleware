@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { SlidingWindowRateLimiter } from "../auth/rateLimiter.js";
 import type { Db } from "../db.js";
-import { getHubConnection, mw } from "../hub/connector.js";
+import { callHub, getHubConnection, mw } from "../hub/connector.js";
 import { enqueueDelivery } from "../hub/outbox.js";
 
 /**
@@ -156,13 +156,61 @@ export async function validatePortalAccess(
 }
 
 // ── Portal-safe reads ────────────────────────────────────────────────────────
-// All content comes from the dealer's curated portal profile. Nothing here
-// can reach inventory, cost, margin, suppliers, customers, or POS data.
+// Hub-connected dealers read live dealer-safe content from the hub's
+// content.* resources (short in-memory TTL); the dealer's locally curated
+// portal profile is the fallback when the hub is unreachable or not
+// connected. Nothing here can reach inventory, cost, margin, suppliers,
+// customers, or POS data.
 
 const profileOf = (ctx: PortalContext) => (ctx.settings.profile ?? {}) as Record<string, unknown>;
 
-export function getPublicDealerProfile(ctx: PortalContext) {
-  const p = profileOf(ctx);
+const CONTENT_TTL_MS = 60_000;
+const contentCache = new Map<string, { at: number; data: unknown }>();
+
+/**
+ * Live-first content read. Failures (no connection, hub down, hub error) are
+ * negative-cached for the same TTL so an unreachable hub costs at most one
+ * attempt per dealer/resource per minute.
+ */
+async function hubContent(db: Db, ctx: PortalContext, resource: string): Promise<unknown> {
+  const cacheKey = `${ctx.settings.dealer_id}:${resource}`;
+  const hit = contentCache.get(cacheKey);
+  if (hit && Date.now() - hit.at < CONTENT_TTL_MS) return hit.data;
+  let data: unknown = null;
+  try {
+    const conn = await getHubConnection(db, ctx.settings.dealer_id);
+    if (conn) {
+      const result = await callHub(conn, resource, { dealer_slug: ctx.settings.slug });
+      if (result.ok) data = result.data ?? null;
+    }
+  } catch {
+    // network failure → fall back to the local profile
+  }
+  contentCache.set(cacheKey, { at: Date.now(), data });
+  return data;
+}
+
+/** Accepts both bare payloads and {key: …} envelopes from the hub. */
+function unwrap(data: unknown, key: string): unknown {
+  if (data && typeof data === "object" && !Array.isArray(data) && key in (data as Record<string, unknown>)) {
+    return (data as Record<string, unknown>)[key];
+  }
+  return data;
+}
+
+const asObject = (v: unknown): Record<string, unknown> | null =>
+  v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+
+const asArray = (v: unknown): unknown[] | null => (Array.isArray(v) ? v : null);
+
+/** For tests / operators: drop all cached hub content. */
+export function clearPortalContentCache(): void {
+  contentCache.clear();
+}
+
+export async function getPublicDealerProfile(db: Db, ctx: PortalContext) {
+  const live = asObject(unwrap(await hubContent(db, ctx, "content.profile"), "profile"));
+  const p = live ?? profileOf(ctx);
   return {
     slug: ctx.settings.slug,
     display_name: p.display_name ?? ctx.settings.slug,
@@ -182,10 +230,11 @@ export function getPublicDealerProfile(ctx: PortalContext) {
   };
 }
 
-export function getPublicDealerBrand(ctx: PortalContext) {
-  const brand = (profileOf(ctx).brand ?? {}) as Record<string, unknown>;
+export async function getPublicDealerBrand(db: Db, ctx: PortalContext) {
+  const live = asObject(unwrap(await hubContent(db, ctx, "content.branding"), "branding"));
+  const brand = live ?? ((profileOf(ctx).brand ?? {}) as Record<string, unknown>);
   return {
-    logo_url: profileOf(ctx).logo_url ?? null,
+    logo_url: brand.logo_url ?? profileOf(ctx).logo_url ?? null,
     primary_color: brand.primary_color ?? "#1f2937",
     secondary_color: brand.secondary_color ?? "#4b5563",
     accent_color: brand.accent_color ?? "#2563eb",
@@ -195,21 +244,26 @@ export function getPublicDealerBrand(ctx: PortalContext) {
   };
 }
 
-export function getPublicDealerServices(ctx: PortalContext) {
-  return (profileOf(ctx).services as unknown[]) ?? [];
+export async function getPublicDealerServices(db: Db, ctx: PortalContext) {
+  // The hub has no content.services resource; services ride on the profile.
+  const live = asObject(unwrap(await hubContent(db, ctx, "content.profile"), "profile"));
+  return asArray(live?.services) ?? (profileOf(ctx).services as unknown[]) ?? [];
 }
 
-export function getPublicDealerLocations(ctx: PortalContext) {
-  return (profileOf(ctx).locations as unknown[]) ?? [];
+export async function getPublicDealerLocations(db: Db, ctx: PortalContext) {
+  const live = asArray(unwrap(await hubContent(db, ctx, "content.locations"), "locations"));
+  return live ?? (profileOf(ctx).locations as unknown[]) ?? [];
 }
 
-export function getPublicDealerPromotions(ctx: PortalContext) {
-  const promos = ((profileOf(ctx).promotions as Record<string, unknown>[]) ?? []).filter((p) => p.active !== false);
-  return promos;
+export async function getPublicDealerPromotions(db: Db, ctx: PortalContext) {
+  const live = asArray(unwrap(await hubContent(db, ctx, "content.promotions"), "promotions"));
+  const promos = (live ?? (profileOf(ctx).promotions as unknown[]) ?? []) as Record<string, unknown>[];
+  return promos.filter((p) => p.active !== false);
 }
 
-export function getPublicCatalogCategories(ctx: PortalContext) {
-  return (profileOf(ctx).catalog_categories as unknown[]) ?? [];
+export async function getPublicCatalogCategories(db: Db, ctx: PortalContext) {
+  const live = asArray(unwrap(await hubContent(db, ctx, "content.categories"), "categories"));
+  return live ?? (profileOf(ctx).catalog_categories as unknown[]) ?? [];
 }
 
 // ── Portal request intake ────────────────────────────────────────────────────
@@ -272,11 +326,15 @@ async function createRequest(
     .select("id, type, status")
     .single();
   if (error) throw new PortalError(500, "could not save your request — please try again");
-  // Forward to the hub (system of record) via the outbox.
+  // Forward to the hub (system of record) via the outbox. The payload is the
+  // hub's portal.request.create contract exactly: portal_request_id is the
+  // local row's uuid, persisted with the delivery, so retries reuse it and
+  // the hub's (org_id, portal_request_id) idempotency holds.
   const conn = await getHubConnection(db, ctx.settings.dealer_id);
   if (conn) {
     await enqueueDelivery(db, ctx.settings.dealer_id, `portal.${type}.create`, {
       portal_request_id: data.id,
+      type,
       dealer_slug: ctx.settings.slug,
       ...customer,
       ...payload,

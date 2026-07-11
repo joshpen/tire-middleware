@@ -70,20 +70,20 @@ export function registerPortalRoutes(app: FastifyInstance, db: Db) {
     }
   };
 
-  const get = (path: string, module: PortalModule, fn: (ctx: PortalContext) => unknown, wrap: string) => {
+  const get = (path: string, module: PortalModule, fn: (ctx: PortalContext) => Promise<unknown>, wrap: string) => {
     app.get<{ Params: { dealerSlug: string } }>(`/api/portal/v1/dealers/:dealerSlug${path}`, async (req, reply) => {
       const ctx = await guard(req, reply, module);
       if (!ctx) return;
-      return { ok: true, [wrap]: fn(ctx) };
+      return { ok: true, [wrap]: await fn(ctx) };
     });
   };
 
-  get("", "events", getPublicDealerProfile, "dealer");
-  get("/brand", "events", getPublicDealerBrand, "brand");
-  get("/services", "services", getPublicDealerServices, "services");
-  get("/locations", "events", getPublicDealerLocations, "locations");
-  get("/promotions", "promotions", getPublicDealerPromotions, "promotions");
-  get("/catalog-categories", "catalog", getPublicCatalogCategories, "categories");
+  get("", "events", (ctx) => getPublicDealerProfile(db, ctx), "dealer");
+  get("/brand", "events", (ctx) => getPublicDealerBrand(db, ctx), "brand");
+  get("/services", "services", (ctx) => getPublicDealerServices(db, ctx), "services");
+  get("/locations", "events", (ctx) => getPublicDealerLocations(db, ctx), "locations");
+  get("/promotions", "promotions", (ctx) => getPublicDealerPromotions(db, ctx), "promotions");
+  get("/catalog-categories", "catalog", (ctx) => getPublicCatalogCategories(db, ctx), "categories");
 
   const post = (
     path: string,

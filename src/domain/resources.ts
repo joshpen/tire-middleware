@@ -122,7 +122,7 @@ export async function upsertProduct(db: Db, actor: Actor, input: ProductInput) {
     if (error) throw new ResourceError(500, `product create failed: ${error.message}`);
     action = "created";
   }
-  // The hub's API has no product write yet; park it for replay.
+  // Forward to the hub (system of record) via the outbox.
   const conn = await hubConn(db, actor.orgId);
   if (conn) await enqueueDelivery(db, actor.orgId, "products.upsert", { ...input, sku });
   return { sku, action };
@@ -254,7 +254,7 @@ export async function createOrder(db: Db, actor: Actor, input: OrderInput) {
     await db.from("purchase_orders").delete().eq("id", order.id);
     throw new ResourceError(500, `order lines failed: ${linesError.message}`);
   }
-  // Hub has no orders.create yet; stage locally + park the delivery.
+  // Staged locally, forwarded to the hub via the outbox.
   const conn = await hubConn(db, actor.orgId);
   if (conn) {
     await enqueueDelivery(db, actor.orgId, "orders.create", {
@@ -409,6 +409,11 @@ export async function createClaim(db: Db, actor: Actor, input: ClaimInput) {
 
 const CLAIM_STATUSES = ["submitted", "under_review", "approved", "denied", "closed"];
 
+// The hub's warranty.claim.update accepts only these statuses; adjudication
+// (approved/denied) is hub-internal by design and must stay local — the hub
+// returns 400 for anything else, which would dead-letter the delivery.
+const HUB_CLAIM_STATUSES = ["under_review", "closed"];
+
 export async function updateClaim(
   db: Db,
   actor: Actor,
@@ -429,12 +434,18 @@ export async function updateClaim(
   const { data, error } = await query.select("id, claim_number, status, resolution");
   if (error) throw new ResourceError(500, error.message);
   if (!data?.length) throw new ResourceError(404, `no claim matches ${idOrNumber}`);
-  const conn = await hubConn(db, actor.orgId);
-  if (conn) {
-    await enqueueDelivery(db, actor.orgId, "warranty.claim.update", {
-      claim_number: data[0]!.claim_number,
-      ...patch,
-    });
+  // Forward only what the hub accepts; local adjudication stays local.
+  const hubPatch: Record<string, unknown> = {};
+  if (patch.status !== undefined && HUB_CLAIM_STATUSES.includes(patch.status)) hubPatch.status = patch.status;
+  if (patch.resolution !== undefined) hubPatch.resolution = patch.resolution;
+  if (Object.keys(hubPatch).length > 0) {
+    const conn = await hubConn(db, actor.orgId);
+    if (conn) {
+      await enqueueDelivery(db, actor.orgId, "warranty.claim.update", {
+        claim_number: data[0]!.claim_number,
+        ...hubPatch,
+      });
+    }
   }
   return data[0];
 }
